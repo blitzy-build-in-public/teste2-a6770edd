@@ -1,0 +1,47 @@
+# Modelo de configuração do finmail.
+#
+# Copie este arquivo para config.yaml e ajuste os valores:
+#     cp config.example.yaml config.yaml
+# O caminho é escolhido com --config (padrão ./config.yaml):
+#     python -m finmail run --config /caminho/absoluto/config.yaml
+#
+# Credenciais não pertencem a este arquivo: SMTP_USERNAME e SMTP_PASSWORD vêm
+# exclusivamente de variáveis de ambiente e nunca são gravadas em disco,
+# registradas em log nem incluídas no e-mail.
+#
+# Chaves desconhecidas são rejeitadas com uma mensagem que nomeia a chave, para
+# que um erro de digitação não vire silenciosamente uma "chave ausente".
+
+# Lista ordenada de 1 a 50 ativos; o relatório mantém exatamente esta ordem.
+# Cada item precisa ser um texto não vazio e não pode se repetir (a comparação
+# ignora maiúsculas: 'aapl' e 'AAPL' são o mesmo ativo).
+# A sintaxe é a do Yahoo Finance: ações da B3 terminam em .SA (PETR4.SA) e
+# criptomoedas usam o par separado por hífen (BTC-USD).
+tickers:
+  - AAPL
+  - PETR4.SA
+  # - BTC-USD
+
+# De 1 a 20 destinatários. Cada item é um endereço puro, sem nome de exibição:
+# use "usuario@exemplo.com", nunca "Nome <usuario@exemplo.com>".
+# Todos os destinatários viajam na mesma e única mensagem da execução.
+recipients:
+  - usuario1@exemplo.com
+  - usuario2@exemplo.com
+
+# Remetente: um único endereço válido, também sem nome de exibição.
+sender: finmail@exemplo.com
+
+# Servidor SMTP de saída. A autenticação acontece sempre depois do STARTTLS,
+# com as credenciais lidas das variáveis de ambiente SMTP_USERNAME e
+# SMTP_PASSWORD — este arquivo não tem, e não deve ter, chave de credencial.
+smtp:
+  # Obrigatório e não vazio.
+  host: smtp.exemplo.com
+  # Padrão 587; se presente, precisa ser um número inteiro de 1 a 65535.
+  port: 587
+
+# Fuso horário padrão, como nome IANA resolvido pelo zoneinfo do sistema.
+# Governa apenas a data do assunto; a data de cada ativo é a do último pregão
+# disponível nos dados.
+timezone: America/Sao_Paulo
