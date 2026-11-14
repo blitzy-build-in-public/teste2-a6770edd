@@ -6,9 +6,8 @@ metadados) sai deste arquivo. Os valores são convertidos para tipos primitivos 
 fronteira, de modo que um ``DataFrame``, uma ``Series`` ou um ``Timestamp`` nunca
 atravessa o contrato público.
 
-Uma requisição de barras por ativo: o metadado do gráfico é o que essa mesma requisição já
-trouxe, guardado no instrumento pela biblioteca, e o acessor público do instrumento fica
-como reserva para quando esse metadado não estiver lá.
+Uma requisição de barras por ativo e o metadado do gráfico lido pelo acessor público do mesmo
+instrumento, ``get_history_metadata()``: nenhuma superfície privada da biblioteca é tocada.
 
 Os diagnósticos de metadado e de nova tentativa saem em ``DEBUG``. O produto fixa o logger
 ``finmail`` em ``INFO`` e não tem opção de nível de log, então essas linhas não aparecem na
@@ -179,25 +178,19 @@ def _is_certificate_failure(exc: BaseException) -> bool:
 
 
 def _graph_metadata(instrument: "yf.Ticker", ticker: str) -> dict[str, object]:
-    """Metadado do gráfico da própria requisição de barras do ativo.
+    """Metadado do gráfico do ativo, lido pelo acessor público do instrumento.
 
-    O metadado que a requisição de barras trouxe já está guardado no instrumento pela
-    biblioteca, e lê-lo daí é o que sustenta uma única requisição por ativo. O acessor
-    público ``get_history_metadata()`` fica como reserva para quando esse metadado não
-    estiver no instrumento — o caso dos dublês de teste e o de uma versão da biblioteca que
-    deixe de guardá-lo. Uma falha ou um formato inesperado não invalida o ativo — apenas
-    deixa ``name`` e ``currency`` ausentes, porque só ``close`` é essencial —, e a causa vai
-    para o log em ``DEBUG`` em vez de desaparecer. Essa linha não aparece na execução
-    normal: o produto fixa o nível em ``INFO`` e não tem opção de nível de log.
+    ``get_history_metadata()`` sobre o mesmo instrumento em que as barras foram pedidas é a
+    única fonte de metadado: nenhum atributo privado da biblioteca é lido. A biblioteca pode
+    emitir uma requisição de acompanhamento por dentro desse acessor quando o metadado
+    diário não traz o calendário de negociação, e essa é uma decisão dela. Uma falha ou um
+    formato inesperado não invalida o ativo — apenas deixa ``name`` e ``currency`` ausentes,
+    porque só ``close`` é essencial —, e a causa vai para o log em ``DEBUG`` em vez de
+    desaparecer. Essa linha não aparece na execução normal: o produto fixa o nível em
+    ``INFO`` e não tem opção de nível de log.
     """
-    # O metadado da requisição já feita é preferido ao acessor público porque, no yfinance
-    # 0.2.66, get_history_metadata() reemite uma requisição intradiária (range=5d,
-    # interval=1h) sempre que o metadado diário não traz o calendário de negociação, o que
-    # dobraria as requisições por ativo.
-    cached = _cached_metadata(instrument, ticker)
-    if cached is not None:
-        return cached
-
+    # O acessor público sobre o mesmo instrumento é a única fonte de metadado; a requisição
+    # de acompanhamento que a biblioteca pode emitir por dentro dele é decisão dela.
     try:
         metadata = instrument.get_history_metadata()
     except Exception as exc:
@@ -213,39 +206,8 @@ def _graph_metadata(instrument: "yf.Ticker", ticker: str) -> dict[str, object]:
     return metadata
 
 
-def _cached_metadata(instrument: "yf.Ticker", ticker: str) -> dict[str, object] | None:
-    """Metadado do gráfico que a requisição de barras deixou no instrumento.
-
-    A biblioteca não publica esse cache, então a leitura é defensiva: atributo ausente —
-    um dublê de teste ou uma versão que deixe de guardá-lo —, formato inesperado ou
-    qualquer falha devolvem ``None``, e quem chama segue para o acessor público. Nenhum
-    desses casos levanta exceção.
-    """
-    loader = getattr(instrument, "_lazy_load_price_history", None)
-    if not callable(loader):
-        return None
-    try:
-        history = loader()
-    except Exception as exc:
-        _LOGGER.debug("Cache do histórico indisponível para %s: %s.", ticker, exc)
-        return None
-    metadata = getattr(history, "_history_metadata", None)
-    if metadata is None:
-        return None
-    if not isinstance(metadata, dict):
-        _LOGGER.debug(
-            "Metadado do gráfico de %s no cache veio como %s, não como dicionário.",
-            ticker,
-            type(metadata).__name__,
-        )
-        return None
-    # Dicionário vazio é o formato esperado sem valor algum: a reserva pública decide, e a
-    # cotação segue valendo com nome e moeda ausentes se ela também não tiver o que dar.
-    return metadata or None
-
-
 def _build_quote(ticker: str, instrument: "yf.Ticker", frame: object) -> Quote:
-    """Converte as barras e o metadado da requisição em uma :class:`Quote` primitiva."""
+    """Converte as barras e o metadado do gráfico em uma :class:`Quote` primitiva."""
     columns = getattr(frame, "columns", ())
     close_series = frame["Close"] if "Close" in columns else None
     close = _to_float(close_series.iloc[-1]) if close_series is not None else None

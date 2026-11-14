@@ -4,10 +4,10 @@ AAP 0.7.3 fixa a origem de cada campo de ``Quote`` e a política de retentativa;
 fixa a superfície da requisição — uma única chamada ``history`` por ativo, com
 ``raise_errors=True``, nunca ``yf.download`` e nunca ``Ticker.info``; AAP 0.5.2 fixa o
 contrato de tipos, em que só ``close`` é obrigatório e nenhum tipo do ``pandas`` atravessa a
-fronteira do adaptador. O metadado do gráfico vem do que essa mesma requisição deixou no
-instrumento, e o dublê reproduz o cache da biblioteca para provar que o acessor público
-``get_history_metadata()`` — que na versão fixada emite uma segunda requisição — não é
-chamado no caminho normal.
+fronteira do adaptador. AAP 0.5.1 fixa também a superfície do metadado: um único
+``get_history_metadata()`` sobre o mesmo instrumento, e nada além dela. O dublê reproduz só
+essa superfície declarada, recusa qualquer atributo privado da biblioteca e conta as
+chamadas ao acessor público.
 
 Nada aqui toca a rede nem espera de verdade: antes de cada ``fetch``, o módulo
 ``yfinance`` que o adaptador importa é substituído por um dublê local e a função de
@@ -50,11 +50,8 @@ LOWS = [9.0, 11.0, 12.5]
 HIGHS = [11.0, 12.5, 14.0]
 VOLUMES = [100, 200, 300]
 
-# Metadado do gráfico da mesma requisição: ``longName`` tem precedência.
+# Metadado do gráfico do acessor público: ``longName`` tem precedência sobre ``shortName``.
 DEFAULT_METADATA = {"longName": "Apple Inc.", "currency": "USD"}
-
-# Distingue "o instrumento não guardou metadado" de "guardou um metadado vazio".
-_UNSET = object()
 
 # Espera entre tentativas: duas novas tentativas, 2 s cada (AAP 0.7.3).
 RETRY_WAITS = [2, 2]
@@ -73,18 +70,6 @@ class CertificateVerifyError(ConnectionError):
     """
 
 
-class HistoryCache:
-    """Cache do histórico que a biblioteca real mantém dentro do instrumento.
-
-    ``yfinance`` 0.2.66 guarda em ``_history_metadata`` o metadado do gráfico que veio na
-    resposta de barras e o mantém em ``None`` enquanto nenhuma requisição aconteceu; é
-    exatamente esse atributo que o adaptador lê para não pedir o metadado de novo.
-    """
-
-    def __init__(self) -> None:
-        self._history_metadata: object = None
-
-
 class RecordingTicker:
     """Dublê do ``yfinance.Ticker``: registra a requisição e segue um roteiro.
 
@@ -93,9 +78,7 @@ class RecordingTicker:
     reutilizado, de modo que "sempre falha" e "sempre devolve o mesmo quadro" não
     precisam de listas do tamanho das tentativas. O metadado segue a mesma regra: uma
     exceção guardada é levantada pelo acessor público e um valor que não é dicionário volta
-    como veio, para exercitar a degradação da fronteira. ``cached_metadata`` é o que
-    ``history`` deixa no cache do instrumento — por padrão o próprio metadado, como faz a
-    biblioteca real, e ``None`` quando o teste quer um instrumento sem cache.
+    como veio, para exercitar a degradação da fronteira.
     """
 
     def __init__(
@@ -103,7 +86,6 @@ class RecordingTicker:
         symbol: str,
         outcomes: list[object],
         metadata: object = None,
-        cached_metadata: object = _UNSET,
     ) -> None:
         self.symbol = symbol
         self.history_calls: list[dict[str, object]] = []
@@ -111,30 +93,18 @@ class RecordingTicker:
         self.info_accessed = False
         self._outcomes = list(outcomes)
         self._metadata = {} if metadata is None else metadata
-        self._cached_metadata = self._metadata if cached_metadata is _UNSET else cached_metadata
-        self._price_history = HistoryCache()
 
     def __getattr__(self, name: str) -> object:
         """Proíbe qualquer atributo privado do ``yfinance`` que o dublê não reproduz.
 
         O dublê reproduz a superfície declarada — ``history`` e ``get_history_metadata`` —
-        e o cache do histórico que a biblioteca mantém no instrumento
-        (``_lazy_load_price_history`` devolvendo ``_history_metadata``). Qualquer outro
-        atributo privado (``_info``, ``_data``) quebra o teste em vez de passar
-        despercebido. Nome público ausente continua levantando ``AttributeError``, como em
-        qualquer objeto, e o mesmo vale para os métodos especiais.
+        e nada mais. Qualquer atributo privado (``_info``, ``_data``) quebra o teste em vez
+        de passar despercebido. Nome público ausente continua levantando ``AttributeError``,
+        como em qualquer objeto, e o mesmo vale para os métodos especiais.
         """
         if name.startswith("_") and not name.startswith("__"):
             raise AssertionError(f"atributo privado do yfinance acessado: {name}")
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
-
-    def _lazy_load_price_history(self) -> HistoryCache:
-        """Cache do histórico do instrumento, como o da biblioteca real.
-
-        É a única superfície privada que o adaptador pode ler, e ele a lê justamente para
-        não chamar o acessor público, que na versão fixada emitiria uma segunda requisição.
-        """
-        return self._price_history
 
     @property
     def info(self) -> object:
@@ -143,24 +113,15 @@ class RecordingTicker:
         raise AssertionError("Ticker.info é proibido (AAP 0.2.1)")
 
     def history(self, **kwargs: object) -> object:
-        """Registra os argumentos da chamada e devolve — ou levanta — o próximo item.
-
-        Como a biblioteca real, guarda no cache do instrumento o metadado do gráfico que
-        acompanha as barras; é dele que o adaptador lê nome e moeda sem nova requisição.
-        """
+        """Registra os argumentos da chamada e devolve — ou levanta — o próximo item."""
         self.history_calls.append(dict(kwargs))
         outcome = self._outcomes[0] if len(self._outcomes) == 1 else self._outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
-        self._price_history._history_metadata = (
-            dict(self._cached_metadata)
-            if isinstance(self._cached_metadata, dict)
-            else self._cached_metadata
-        )
         return outcome
 
     def get_history_metadata(self) -> object:
-        """Metadado do gráfico que acompanha as barras; conta as chamadas.
+        """Metadado do gráfico do acessor público; conta as chamadas.
 
         Uma exceção guardada é levantada e um metadado que não é dicionário é devolvido
         como veio: é assim que o teste força a falha e o formato inesperado do acessor
@@ -179,11 +140,9 @@ class FakeYf:
         self,
         outcomes: list[object],
         metadata: object = DEFAULT_METADATA,
-        cached_metadata: object = _UNSET,
     ) -> None:
         self._outcomes = list(outcomes)
         self._metadata = metadata
-        self._cached_metadata = cached_metadata
         self.created: list[RecordingTicker] = []
 
     def Ticker(self, symbol: str) -> RecordingTicker:
@@ -192,7 +151,6 @@ class FakeYf:
             symbol,
             self._outcomes,
             metadata=self._metadata,
-            cached_metadata=self._cached_metadata,
         )
         self.created.append(instrument)
         return instrument
@@ -252,10 +210,9 @@ def install_fake_yf(
     monkeypatch: pytest.MonkeyPatch,
     outcomes: list[object],
     metadata: object = DEFAULT_METADATA,
-    cached_metadata: object = _UNSET,
 ) -> FakeYf:
     """Substitui o ``yfinance`` do adaptador e devolve o dublê instalado."""
-    fake = FakeYf(outcomes, metadata=metadata, cached_metadata=cached_metadata)
+    fake = FakeYf(outcomes, metadata=metadata)
     monkeypatch.setattr(quotes, "yf", fake)
     return fake
 
@@ -282,7 +239,7 @@ def fetch_quote(
     patch_sleep(monkeypatch)
     quote = fetch(TICKER)
     # ``Ticker.info`` é vetado em todo caminho: o adaptador tem de viver da requisição
-    # de barras e do metadado do gráfico que veio com ela.
+    # de barras e do metadado lido pelo acessor público do mesmo instrumento.
     assert not any(instrument.info_accessed for instrument in fake.created)
     return quote
 
@@ -480,7 +437,13 @@ def test_faixa_52_semanas_sem_nenhum_valor_vira_none(monkeypatch: pytest.MonkeyP
 
 
 def test_uma_requisicao_por_ativo(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Um ``Ticker``, uma chamada de ``history`` e nenhuma requisição de acompanhamento."""
+    """Um ``Ticker``, uma chamada de ``history`` e uma do acessor público de metadado.
+
+    AAP 0.5.1 fixa a superfície externa inteira e nada além dela: ``yfinance.Ticker(ticker)``,
+    um ``history(period="1y", interval="1d", auto_adjust=False, timeout=10,
+    raise_errors=True)`` e um ``get_history_metadata()`` sobre o mesmo objeto — em particular
+    nenhum atributo privado da biblioteca.
+    """
     fake = install_fake_yf(monkeypatch, [frame(CLOSES)])
     patch_sleep(monkeypatch)
 
@@ -489,10 +452,17 @@ def test_uma_requisicao_por_ativo(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(fake.created) == 1
     instrument = fake.created[0]
     assert instrument.symbol == TICKER
-    assert len(instrument.history_calls) == 1
-    # O metadado vem do que a requisição de barras já trouxe; o acessor público, que na
-    # versão fixada da biblioteca emitiria uma segunda requisição, não é chamado.
-    assert instrument.metadata_calls == 0
+    assert instrument.history_calls == [
+        {
+            "period": "1y",
+            "interval": "1d",
+            "auto_adjust": False,
+            "timeout": 10,
+            "raise_errors": True,
+        }
+    ]
+    # O metadado sai do acessor público do próprio instrumento, uma vez por ativo.
+    assert instrument.metadata_calls == 1
     # ``Ticker.info`` custaria outra requisição e não pode ser tocado.
     assert instrument.info_accessed is False
 
@@ -535,12 +505,11 @@ def test_parametros_da_requisicao_sao_os_documentados(monkeypatch: pytest.Monkey
     ]
 
 
-def test_metadado_vem_da_mesma_requisicao(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Nome e moeda saem do metadado que a própria requisição de barras deixou no ativo.
+def test_metadado_vem_do_acessor_publico(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nome e moeda saem do acessor público do instrumento, chamado uma única vez.
 
-    O dublê reproduz o cache da biblioteca e recusa qualquer outro atributo privado, então
-    a cotação só pode usar o metadado da requisição já feita — e o acessor público, que na
-    versão fixada emitiria uma segunda requisição, não chega a ser chamado.
+    AAP 0.5.1 declara ``get_history_metadata()`` como a superfície do metadado e AAP 0.7.3
+    fixa a origem dos campos: ``name`` de ``longName`` e ``currency`` da chave ``currency``.
     """
     metadata = {"longName": "Petróleo Brasileiro S.A. - Petrobras", "currency": "BRL"}
     fake = install_fake_yf(monkeypatch, [frame(CLOSES)], metadata=metadata)
@@ -552,55 +521,6 @@ def test_metadado_vem_da_mesma_requisicao(monkeypatch: pytest.MonkeyPatch) -> No
     assert quote.currency == "BRL"
     assert len(fake.created) == 1
     assert len(fake.created[0].history_calls) == 1
-    assert fake.created[0].metadata_calls == 0
-
-
-def test_sem_cache_no_instrumento_usa_o_acessor_publico(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Instrumento que não guarda o metadado: nome e moeda vêm do acessor, uma vez.
-
-    É a reserva que mantém o adaptador funcionando com um dublê de teste ou com uma versão
-    futura da biblioteca que deixe de manter o metadado no instrumento: o ativo não perde
-    nome nem moeda por isso.
-    """
-    metadata = {"longName": "Apple Inc.", "currency": "USD"}
-    fake = install_fake_yf(
-        monkeypatch,
-        [frame(CLOSES)],
-        metadata=metadata,
-        cached_metadata=None,
-    )
-    patch_sleep(monkeypatch)
-
-    quote = fetch(TICKER)
-
-    assert quote.name == "Apple Inc."
-    assert quote.currency == "USD"
-    assert quote.close == 13.0
-    assert fake.created[0].metadata_calls == 1
-
-
-def test_cache_de_metadado_vazio_nao_perde_a_cotacao(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cache vazio e acessor em falha não custam o ativo: só ``close`` é essencial.
-
-    O metadado vazio do cache manda a leitura para a reserva pública, que também não tem o
-    que dar; AAP 0.7.3 mantém a linha, com nome e moeda ausentes.
-    """
-    fake = install_fake_yf(
-        monkeypatch,
-        [frame(CLOSES)],
-        metadata=RuntimeError("acessor também falhou no teste"),
-        cached_metadata={},
-    )
-    patch_sleep(monkeypatch)
-
-    quote = fetch(TICKER)
-
-    assert quote.name is None
-    assert quote.currency is None
-    assert quote.close == 13.0
-    assert quote.last_trading_date == LAST_TRADING_DATE
     assert fake.created[0].metadata_calls == 1
 
 
@@ -625,7 +545,7 @@ def test_metadado_indisponivel_degrada_com_a_causa_no_log(
 
     AAP 0.7.3 mantém o ativo porque só ``close`` é essencial; AAP 0.15.1 proíbe a captura
     que descarta a causa, então a linha do log precisa nomear o ativo e trazer o motivo da
-    falha — de exceção ou de tipo inesperado, no cache ou no acessor — em vez de a
+    falha — de exceção ou de tipo inesperado no acessor público — em vez de a
     degradação ficar invisível. O produto fixa o logger em ``INFO`` e não tem opção de nível
     de log: é este teste que baixa o nível para ``DEBUG``, de modo que a linha só é visível
     aqui, nunca na execução normal.
