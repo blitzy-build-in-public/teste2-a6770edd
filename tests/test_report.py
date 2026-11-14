@@ -15,10 +15,12 @@ de HTML apenas no HTML e rodapé fixo nos dois corpos.
 
 import re
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from finmail import report as finmail_report
 from finmail.quotes import Quote, QuoteError
 from finmail.report import Report, build
 
@@ -56,6 +58,10 @@ _CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
 _STYLE = re.compile(r"<style>(.*?)</style>", re.DOTALL)
 _CSS_RULE = re.compile(r"\.(?P<classe>[\w-]+)\s*\{(?P<declaracoes>[^}]*)\}")
 _CSS_COLOR = re.compile(r"color\s*:\s*(?P<cor>#[0-9a-fA-F]{3,8})")
+# Templates empacotados, lidos a partir do próprio módulo: é neles que se procura a
+# chave do modelo de visão que cada corpo realmente consome.
+TEMPLATES = Path(finmail_report.__file__).parent / "templates"
+_ROW_ACCESS = re.compile(r"\brow\.(\w+)")
 
 
 def good(ticker: str = "AAPL", **overrides: object) -> Quote:
@@ -233,6 +239,46 @@ def test_cada_linha_de_ativo_tem_exatamente_onze_campos() -> None:
         assert len(line.split(SEPARATOR)) == 11
         assert not line.startswith(SEPARATOR)
         assert not line.endswith(SEPARATOR)
+
+
+@pytest.mark.parametrize(
+    ("entry", "column", "expected"),
+    [
+        pytest.param(good(name="Empresa | Divisão Sul"), 1, "Empresa ¦ Divisão Sul",
+                     id="nome-com-separador"),
+        pytest.param(good(name="Empresa\nDivisão Sul"), 1, "Empresa Divisão Sul",
+                     id="nome-com-quebra-de-linha"),
+        pytest.param(good(name="A\tB\r\nC"), 1, "A B C", id="nome-com-tab-e-crlf"),
+        pytest.param(good(name="|"), 1, "¦", id="nome-igual-ao-separador"),
+        pytest.param(good(name="  \t "), 1, ND, id="nome-so-espacos"),
+        pytest.param(good(ticker="A | B"), 0, "A ¦ B", id="ticker-com-separador"),
+        pytest.param(good(ticker="  \t "), 0, ND, id="ticker-so-espacos"),
+        pytest.param(QuoteError("A\nB.SA", "sem preços"), 0, "A B.SA", id="ticker-com-quebra"),
+        pytest.param(
+            QuoteError("QB2.SA", "motivo | com delimitador\nsegunda linha"),
+            10,
+            "dados indisponíveis: motivo ¦ com delimitador segunda linha",
+            id="motivo-com-separador-e-quebra",
+        ),
+    ],
+)
+def test_valor_hostil_fica_em_uma_linha_e_em_uma_coluna(
+    entry: Quote | QuoteError, column: int, expected: str
+) -> None:
+    # AAP 0.5.4 (o separador existe "para que nomes longos não quebrem o alinhamento")
+    # e F9 (uma linha por ativo): um valor com ``|`` ou com quebra de linha não pode
+    # partir a linha em campos a mais, e os dois corpos precisam concordar célula a
+    # célula — o HTML sempre manteve as onze colunas.
+    report = build([entry], NOW)
+    lines = asset_lines(report)
+    cells = row_cells(report.html, 1)
+
+    assert len(lines) == 1
+    assert len(cells) == 11
+    fields = lines[0].split(SEPARATOR)
+    assert len(fields) == 11
+    assert fields[column] == expected
+    assert fields == cells
 
 
 def test_corpo_texto_termina_com_uma_unica_quebra_de_linha() -> None:
@@ -578,6 +624,24 @@ def test_ticker_e_motivo_escapados_apenas_no_html() -> None:
     assert "motivo <x>" not in report.html
     assert fields[0] == "A&B"
     assert fields[10] == "dados indisponíveis: motivo <x>"
+
+
+# --- Modelo de visão e templates (AAP 0.5.2, AAP 0.15.2) ----------------------
+
+
+def test_toda_chave_da_linha_tem_consumidor_e_todo_acesso_tem_provedor() -> None:
+    # A linha chegou a carregar ``motivo`` e ``estado`` para o mesmo fato, com só
+    # ``estado`` lido. As duas direções precisam valer: nenhuma chave emitida sem
+    # consumidor — AAP 0.15.2, todo campo do relatório alimenta os dois templates — e
+    # nenhum ``row.<nome>`` acessado sem provedor no modelo de visão de 0.5.2.
+    sucesso = set(finmail_report._row_for_entry(good()))
+    falha = set(finmail_report._row_for_entry(failure_btc()))
+    consumidas: set[str] = set()
+    for template in sorted(TEMPLATES.glob("*.j2")):
+        consumidas |= set(_ROW_ACCESS.findall(template.read_text(encoding="utf-8")))
+
+    assert sucesso == falha
+    assert consumidas == sucesso
 
 
 # --- Determinismo e formato do Report -----------------------------------------

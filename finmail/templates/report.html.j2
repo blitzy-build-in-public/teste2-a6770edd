@@ -79,7 +79,7 @@
         <td class="num">{{ row.volume }}</td>
         <td class="num">{{ row.min52 }}</td>
         <td class="num">{{ row.max52 }}</td>
-        <td>{{ row.estado }}</td>
+        <td>{% if row.falha %}{{ estado_falha }}: {{ row.motivo }}{% else %}{{ estado_ok }}{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

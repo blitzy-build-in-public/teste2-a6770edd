@@ -10,10 +10,13 @@ entrada produz sempre os mesmos bytes.
 A formatação pt-BR (vírgula decimal, ponto de milhar, sentinela ``n/d``) é feita
 aqui sem ``locale``, e nenhum valor sai pré-escapado: o escape de HTML é
 responsabilidade do autoescape do template ``report.html.j2``, enquanto o corpo
-texto mantém os nomes literais.
+texto mantém os nomes literais. Todo valor de texto atravessa um único
+normalizador, que o deixa em uma linha física e sem o ``|`` do separador de
+colunas; por isso os dois corpos trazem exatamente a mesma célula.
 """
 
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -39,12 +42,22 @@ POSITIVO = "positivo"
 NEGATIVO = "negativo"
 NEUTRO = "neutro"
 
+# Os dois literais da coluna ``Estado``: entregues aos templates pelo contexto de
+# :func:`build`, para que a célula seja composta de ``falha`` e ``motivo`` sem que o
+# texto fixo apareça duas vezes.
 _UNAVAILABLE_PREFIX = "dados indisponíveis"
 _OK = "ok"
 _TEXT_TEMPLATE = "report.txt.j2"
 _HTML_TEMPLATE = "report.html.j2"
 # Caractere intermediário da troca de separadores, fora de qualquer número formatado.
 _GROUP_MARK = "\x00"
+# ``\s`` cobre também as quebras que ``str.splitlines`` honra além de CR e LF — ``\x85``,
+# ``\u2028`` e ``\u2029`` —, então colapsá-lo mantém uma linha física por ativo.
+_WHITESPACE = re.compile(r"\s+")
+# O corpo texto separa as colunas com ``" | "``; um ``|`` trazido por um valor se
+# confunde com o separador e parte a linha em campos a mais, então todo ``|`` vira
+# barra quebrada (``¦``), que mantém o valor legível e a célula livre do separador.
+_PIPE_SUBSTITUTE = "¦"
 
 # O autoescape é habilitado por extensão: só o template HTML escapa ``&``, ``<``,
 # ``>``, ``'`` e ``"``; o corpo texto preserva ``AT&T`` e ``Lowe's`` literais.
@@ -76,9 +89,10 @@ def build(entries: Sequence["Quote | QuoteError"], now: datetime) -> Report:
 
     Uma linha por entrada, na ordem recebida, que é a ordem de ``Config.tickers``
     garantida por ``cli.handle_run``. Uma entrada ``QuoteError`` vira a linha de
-    falha do próprio ticker, com ``n/d`` nas nove colunas de mercado e
-    ``dados indisponíveis: <motivo>`` na coluna ``Estado``; nenhum dado ausente
-    levanta exceção.
+    falha do próprio ticker, com ``n/d`` nas nove colunas de mercado; a coluna
+    ``Estado`` é composta pelos dois templates a partir de ``falha`` e ``motivo``,
+    de modo que o motivo tem uma representação única no modelo de visão e nenhum
+    dado ausente levanta exceção.
 
     Args:
         entries: Cotações e falhas por ativo, na ordem da configuração.
@@ -91,7 +105,13 @@ def build(entries: Sequence["Quote | QuoteError"], now: datetime) -> Report:
     """
     rows = [_row_for_entry(entry) for entry in entries]
     subject = SUBJECT_TEMPLATE.format(date=now.strftime("%Y-%m-%d"))
-    context = {"subject": subject, "rows": rows, "footer": FOOTER}
+    context = {
+        "subject": subject,
+        "rows": rows,
+        "footer": FOOTER,
+        "estado_ok": _OK,
+        "estado_falha": _UNAVAILABLE_PREFIX,
+    }
     return Report(
         subject=subject,
         text=_ENVIRONMENT.get_template(_TEXT_TEMPLATE).render(**context),
@@ -112,7 +132,11 @@ def _row_for_entry(entry: "Quote | QuoteError") -> dict[str, Any]:
 
 
 def _success_row(quote: "Quote") -> dict[str, Any]:
-    """Linha de um ativo cotado, com os valores formatados e ``Estado`` = ``ok``.
+    """Linha de um ativo cotado, com os valores formatados e ``falha`` = ``False``.
+
+    ``motivo`` sai vazio porque só a linha com falha o preenche; é de ``falha`` e
+    ``motivo`` que os dois templates compõem a coluna ``Estado``, que aqui sai
+    ``ok``.
 
     As duas colunas de variação são formatadas de forma independente: cada uma
     leva o texto e a direção do próprio valor, porque os dois números arredondam
@@ -122,7 +146,7 @@ def _success_row(quote: "Quote") -> dict[str, Any]:
     variacao, direcao = _variacao(quote.change)
     variacao_pct, direcao_pct = _variacao(quote.change_pct, suffix="%")
     return {
-        "ticker": quote.ticker,
+        "ticker": _format_text(quote.ticker),
         "nome": _format_text(quote.name),
         "moeda": _format_text(quote.currency),
         "data": _format_date(quote.last_trading_date),
@@ -136,7 +160,6 @@ def _success_row(quote: "Quote") -> dict[str, Any]:
         "direcao_pct": direcao_pct,
         "falha": False,
         "motivo": "",
-        "estado": _OK,
     }
 
 
@@ -144,11 +167,13 @@ def _failure_row(error: "QuoteError") -> dict[str, Any]:
     """Linha de um ativo sem dados, mantendo o ticker na posição configurada.
 
     ``QuoteError`` carrega apenas ``ticker`` e ``reason``, então as nove colunas
-    de mercado mostram ``n/d`` e o motivo aparece na coluna ``Estado``.
+    de mercado mostram ``n/d`` e o motivo sai sozinho em ``motivo``, normalizado
+    como as demais células de texto mas nunca trocado pela sentinela: a coluna
+    ``Estado`` dos dois templates compõe ``dados indisponíveis: <motivo>`` a
+    partir de ``falha`` e ``motivo``.
     """
-    reason = error.reason
     return {
-        "ticker": error.ticker,
+        "ticker": _format_text(error.ticker),
         "nome": NOT_AVAILABLE,
         "moeda": NOT_AVAILABLE,
         "data": NOT_AVAILABLE,
@@ -161,16 +186,20 @@ def _failure_row(error: "QuoteError") -> dict[str, Any]:
         "direcao": NEUTRO,
         "direcao_pct": NEUTRO,
         "falha": True,
-        "motivo": reason,
-        "estado": f"{_UNAVAILABLE_PREFIX}: {reason}",
+        "motivo": _normalize_text(error.reason),
     }
 
 
+def _normalize_text(value: str) -> str:
+    """Valor em uma linha física e sem o separador de colunas do corpo texto."""
+    return _WHITESPACE.sub(" ", value).strip().replace("|", _PIPE_SUBSTITUTE)
+
+
 def _format_text(value: str | None) -> str:
-    """Texto já livre de espaços nas pontas, ou ``n/d`` quando ausente ou vazio."""
+    """Texto em uma linha, livre do separador, ou ``n/d`` quando ausente ou vazio."""
     if value is None:
         return NOT_AVAILABLE
-    return value.strip() or NOT_AVAILABLE
+    return _normalize_text(value) or NOT_AVAILABLE
 
 
 def _format_date(value: date | None) -> str:
