@@ -70,10 +70,90 @@ OMIT = object()
 
 _CREDENTIAL_VARS = ("SMTP_USERNAME", "SMTP_PASSWORD")
 
+# Único ambiente herdado por um subprocesso da suíte: o que a inicialização do CPython
+# e o sistema de arquivos precisam, mais as ``LC_*`` do operador. Deliberadamente de
+# fora ficam ``PYTHONPATH``, ``PYTHONHOME``, ``PYTHONSTARTUP``, ``PYTHONWARNINGS``, os
+# proxies e qualquer credencial. A comparação ignora a caixa para valer também em um
+# host que grafe ``SystemRoot``.
+_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "SYSTEMROOT",
+    }
+)
+
 _GUARD_MARKER = "__finmail_guard__"
 _BLOCKED_MESSAGE = "acesso de rede externo bloqueado pela guarda de teste: "
 _LOOPBACK_V4 = ipaddress.ip_network("127.0.0.0/8")
 _LOOPBACK_V6 = ipaddress.IPv6Address("::1")
+
+# Sondagem da guarda de rede, executada uma vez por sessão em um subprocesso cujo
+# ambiente é o de ``_subprocess_env``. Os dois argumentos são o diretório da guarda e
+# o diretório do dublê de ``yfinance``. O código roda no filho, não imprime nada no
+# caminho de sucesso e falha com um traceback que nomeia a verificação que caiu. O
+# destino 192.0.2.1 (TEST-NET-1) é recusado pela guarda antes de o SO ser tocado; sem
+# guarda, o ``timeout`` de 1 s limita a espera e a tentativa não termina em
+# ``ConnectionRefusedError`` nem em ``errno.ECONNREFUSED``.
+_GUARD_PROBE_CODE = """
+import errno
+import os
+import pathlib
+import socket
+import sys
+
+guard_dir = pathlib.Path(sys.argv[1]).resolve()
+stub_dir = pathlib.Path(sys.argv[2]).resolve()
+
+guarda = sys.modules.get("sitecustomize")
+assert guarda is not None, "sitecustomize nao foi carregado no subprocesso"
+carregada = pathlib.Path(guarda.__file__).resolve()
+assert carregada == guard_dir / "sitecustomize.py", (
+    "sitecustomize veio de %s, esperado %s" % (carregada, guard_dir / "sitecustomize.py")
+)
+
+for nome in ("connect", "connect_ex"):
+    alvo = getattr(socket.socket, nome)
+    assert getattr(alvo, "__finmail_guard__", False), (
+        "socket.socket.%s nao carrega a marca __finmail_guard__" % nome
+    )
+
+for nome in ("SMTP_USERNAME", "SMTP_PASSWORD"):
+    assert nome not in os.environ, (
+        "credencial %s herdada pelo subprocesso; ela so pode chegar por override" % nome
+    )
+
+import yfinance
+
+origem = pathlib.Path(yfinance.__file__).resolve()
+assert origem.is_relative_to(stub_dir), (
+    "yfinance veio de %s, esperado o duble sob %s" % (origem, stub_dir)
+)
+
+try:
+    socket.create_connection(("192.0.2.1", 80), timeout=1)
+except ConnectionRefusedError:
+    pass
+else:
+    raise AssertionError("create_connection para destino externo nao foi recusado")
+
+sonda = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sonda.settimeout(1)
+    codigo = sonda.connect_ex(("192.0.2.1", 80))
+finally:
+    sonda.close()
+assert codigo == errno.ECONNREFUSED, (
+    "connect_ex para destino externo devolveu %r, esperado ECONNREFUSED (%d)"
+    % (codigo, errno.ECONNREFUSED)
+)
+"""
 
 
 def _is_loopback_host(host: object) -> bool:
@@ -119,37 +199,45 @@ def _is_allowed(address: object) -> bool:
 def _install_socket_guard() -> tuple[Any, Any] | None:
     """Instala a guarda de loopback no processo e devolve o que restaurar.
 
-    Devolve ``None`` quando a guarda já estava instalada — por exemplo pelo
-    ``sitecustomize`` carregado no próprio processo —, para que o teardown da
-    fixture não desfaça uma instalação que não é dela e nenhum invólucro se
-    empilhe.
+    Devolve ``None`` só quando as duas metades da guarda — ``connect`` e
+    ``connect_ex`` — já estavam instaladas, por exemplo pelo ``sitecustomize``
+    carregado no próprio processo, para que o teardown da fixture não desfaça uma
+    instalação que não é dela e nenhum invólucro se empilhe. Uma guarda pela metade
+    não conta como instalada: a metade que falta é posta aqui e o par de callables
+    anteriores à instalação é devolvido assim mesmo, de modo que o teardown reponha
+    exatamente o que esta função substituiu — inclusive um invólucro que já existia.
     """
     original_connect = socket.socket.connect
-    if getattr(original_connect, _GUARD_MARKER, False):
+    original_connect_ex = socket.socket.connect_ex
+    connect_guarded = getattr(original_connect, _GUARD_MARKER, False)
+    connect_ex_guarded = getattr(original_connect_ex, _GUARD_MARKER, False)
+    if connect_guarded and connect_ex_guarded:
         return None
 
-    def connect(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
-        if not _is_allowed(address):
-            # Levanta antes de tocar o socket: o destino externo nunca chega ao SO.
-            raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
-        return original_connect(self, address, *args, **kwargs)
+    if not connect_guarded:
 
-    setattr(connect, _GUARD_MARKER, True)
+        def connect(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
+            if not _is_allowed(address):
+                # Levanta antes de tocar o socket: o destino externo nunca chega ao SO.
+                raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
+            return original_connect(self, address, *args, **kwargs)
 
-    original_connect_ex = socket.socket.connect_ex
-
-    def connect_ex(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> int:
-        if not _is_allowed(address):
-            # ``connect_ex`` sinaliza erro pelo retorno, não por exceção.
-            return errno.ECONNREFUSED
-        return original_connect_ex(self, address, *args, **kwargs)
-
-    setattr(connect_ex, _GUARD_MARKER, True)
+        setattr(connect, _GUARD_MARKER, True)
+        socket.socket.connect = connect
 
     # ``connect_ex`` é outro descritor do mesmo objeto C: proteger só ``connect``
     # deixaria um caminho aberto para a rede externa.
-    socket.socket.connect = connect
-    socket.socket.connect_ex = connect_ex
+    if not connect_ex_guarded:
+
+        def connect_ex(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> int:
+            if not _is_allowed(address):
+                # ``connect_ex`` sinaliza erro pelo retorno, não por exceção.
+                return errno.ECONNREFUSED
+            return original_connect_ex(self, address, *args, **kwargs)
+
+        setattr(connect_ex, _GUARD_MARKER, True)
+        socket.socket.connect_ex = connect_ex
+
     return original_connect, original_connect_ex
 
 
@@ -399,38 +487,47 @@ def smtp_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[SmtpHarness]:
 def _subprocess_env(overrides: dict[str, str | None] | None = None) -> dict[str, str]:
     """Ambiente de um subprocesso da suíte: isolado do real e sem credencial.
 
-    ``PYTHONPATH`` recebe o dublê de ``yfinance`` primeiro, para sombrear o
-    pacote instalado, a guarda de rede em seguida, para que o CPython importe
-    ``sitecustomize`` na inicialização, o ``PYTHONPATH`` herdado (ou o do
-    chamador) e, por último, a raiz do repositório, como rede de segurança para
-    uma instalação editável. ``SSL_CERT_FILE`` aponta para o certificado local,
-    de modo que o ``ssl.create_default_context()`` do produto o aceite. Um
-    override com valor ``None`` remove a variável do ambiente final.
+    O ambiente nasce de um allowlist explícito — só o que a inicialização do CPython
+    e o sistema de arquivos precisam, mais as ``LC_*`` do operador —, não de
+    ``dict(os.environ)``: uma falha do filho tem de depender do código em teste, nunca
+    do shell de quem roda a suíte, e um ``finmail`` ou ``yfinance`` de outro checkout
+    não pode sombrear a árvore em teste por um ``PYTHONPATH`` herdado.
+
+    O ``PYTHONPATH`` do filho é composto apenas por este harness: o dublê de
+    ``yfinance`` primeiro, para sombrear o pacote instalado, a guarda de rede em
+    seguida, para que o CPython importe ``sitecustomize`` na inicialização, e por
+    último a raiz do repositório, como rede de segurança para uma instalação
+    editável. ``SSL_CERT_FILE`` aponta para o certificado local, de modo que o
+    ``ssl.create_default_context()`` do produto o aceite, e ``PYTHONUNBUFFERED`` e
+    ``PYTHONDONTWRITEBYTECODE`` fixam a escrita e o cache do filho.
+
+    ``overrides`` é aplicado por último e vence o padrão do harness: um override de
+    ``PYTHONPATH``, ``SSL_CERT_FILE``, ``PYTHONUNBUFFERED`` ou
+    ``PYTHONDONTWRITEBYTECODE`` é honrado como veio, e o de ``PYTHONPATH`` substitui
+    deliberadamente o arranjo dublê mais guarda. Credencial chega ao filho apenas por
+    um override, nunca por herança; um override com valor ``None`` remove a variável
+    do ambiente final.
     """
-    env = dict(os.environ)
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        name_upper = name.upper()
+        if name_upper in _ENV_ALLOWLIST or name_upper.startswith("LC_"):
+            env[name] = value
+    # A credencial nunca entra por herança: o allowlist já a exclui, e a remoção
+    # explícita mantém a garantia do critério 8 mesmo se o allowlist mudar.
     for name in _CREDENTIAL_VARS:
         env.pop(name, None)
 
-    removals: list[str] = []
-    for key, value in (overrides or {}).items():
-        if value is None:
-            removals.append(key)
-            env.pop(key, None)
-        else:
-            env[key] = str(value)
-
-    pythonpath = [str(STUB_DIR), str(GUARD_DIR)]
-    inherited = env.get("PYTHONPATH")
-    if inherited:
-        pythonpath.append(inherited)
-    pythonpath.append(str(REPO_ROOT))
-
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join([str(STUB_DIR), str(GUARD_DIR), str(REPO_ROOT)])
     env["SSL_CERT_FILE"] = str(CERT_PATH)
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    for key in removals:
-        env.pop(key, None)
+
+    for key, value in (overrides or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = str(value)
     return env
 
 
@@ -467,6 +564,40 @@ def _run(
             f"o comando {command!r} excedeu {timeout}s.\n"
             f"stdout:\n{stdout}\nstderr:\n{stderr}"
         ) from exc
+
+
+@pytest.fixture(scope="session", autouse=True)
+def guard_liveness() -> None:
+    """Prova, em um subprocesso por sessão, que a guarda de rede está viva.
+
+    Compor o ambiente de ``_subprocess_env`` só *arranja* o bloqueio: sem esta
+    sonda, uma guarda que tivesse deixado de instalar, uma marca ausente em
+    ``socket.socket.connect_ex`` ou um dublê de ``yfinance`` que perdesse a
+    precedência deixariam a suíte verde com a metade "sem rede" do critério 5 da
+    AAP 0.9 falsa. O filho carrega a guarda pelo ``sitecustomize``, confirma as duas
+    marcas e a origem do dublê e tenta um destino externo, que tem de ser recusado.
+    O caminho de sucesso é silencioso, como o de qualquer subprocesso do produto —
+    ``tests/test_end_to_end.py`` observa que não há nada em ``stderr``.
+    """
+    probe = _run(
+        [sys.executable, "-c", _GUARD_PROBE_CODE, str(GUARD_DIR), str(STUB_DIR)],
+        env=None,
+        timeout=60,
+    )
+    stdout = probe.stdout or ""
+    stderr = probe.stderr or ""
+    assert probe.returncode == 0, (
+        f"a sondagem da guarda de rede falhou no subprocesso (código "
+        f"{probe.returncode}): a guarda de {GUARD_DIR / 'sitecustomize.py'} não foi "
+        "carregada a partir do PYTHONPATH, a marca __finmail_guard__ falta em "
+        "socket.socket.connect ou em socket.socket.connect_ex, o dublê de yfinance não "
+        "sombreia o pacote instalado, ou um destino externo não foi recusado.\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+    assert stdout == "" and stderr == "", (
+        "a sondagem da guarda de rede escreveu nos streams do subprocesso; o caminho de "
+        f"sucesso tem de ser silencioso.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    )
 
 
 @pytest.fixture
