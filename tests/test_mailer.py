@@ -986,15 +986,18 @@ def test_credencial_nao_ascii_vira_falha_permanente_sem_ecoa_la(
             assert "position" not in renderizacao
 
 
-def test_repr_das_credenciais_nao_expoe_a_senha(
+def test_repr_e_str_das_credenciais_nao_expoem_os_valores(
     sentinel_username: str,
     sentinel_password: str,
 ) -> None:
-    """A representação do objeto carrega o usuário e omite a senha."""
+    """Nem a representação nem o texto do objeto carregam o usuário ou a senha."""
     credencial = credentials(sentinel_username, sentinel_password)
 
-    assert sentinel_username in repr(credencial)
+    assert "Credentials(" in repr(credencial)
+    assert sentinel_username not in repr(credencial)
     assert sentinel_password not in repr(credencial)
+    assert sentinel_username not in str(credencial)
+    assert sentinel_password not in str(credencial)
 
 
 # --- Identidade da mensagem entre tentativas (AAP 0.9) ------------------------

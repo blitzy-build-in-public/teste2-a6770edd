@@ -6,8 +6,8 @@ qualquer I/O de rede: uma configuração inválida vira :class:`ConfigError`, a
 mensagem nomeia o campo e o motivo, e nenhum socket é aberto.
 
 Nada é gravado em disco e nenhum segredo entra em log, exceção ou ``repr``: o
-esquema do YAML não tem chave de credencial e a senha de :class:`Credentials`
-fica fora da representação do objeto.
+esquema do YAML não tem chave de credencial e o usuário e a senha de
+:class:`Credentials` ficam fora da representação do objeto.
 """
 
 import os
@@ -38,6 +38,46 @@ _ROOT_KEYS_HINT = (
     "conteúdo deve ser um mapeamento com as chaves "
     "tickers, recipients, sender, smtp e timezone"
 )
+# A chave desconhecida vem do documento e a mensagem precisa nomeá-la: só
+# alfanuméricos, ``_``, ``-`` e ``.`` são reproduzidos, e o resultado é limitado
+# a este tamanho, para que um arquivo alheio apontado por ``--config`` não
+# escreva uma linha de si mesmo no log do operador.
+_MAX_RENDERED_NAME = 40
+_RENDERED_NAME_ELLIPSIS = "…"
+
+
+def _render_document_name(value: object) -> str:
+    """Reproduz um nome lido do documento como uma linha curta e imprimível.
+
+    Só alfanuméricos de qualquer alfabeto, ``_``, ``-`` e ``.`` são copiados; todo
+    outro caractere vira ``\\xNN`` (abaixo de 0x100) ou ``\\uNNNN``, o que impede
+    que um nome do documento divida a linha do diagnóstico ou mova o cursor do
+    terminal. O resultado para em :data:`_MAX_RENDERED_NAME` caracteres, com
+    ``…`` no fim, para que um arquivo alheio apontado por ``--config`` não seja
+    copiado para o log do operador.
+
+    Args:
+        value: nome vindo do documento, que pode não ser ``str``.
+
+    Returns:
+        O nome reescrito, sempre com um único caractere imprimível por posição.
+    """
+    text = value if isinstance(value, str) else str(value)
+    rendered: list[str] = []
+    length = 0
+    for character in text:
+        if character.isalnum() or character in "-_.":
+            piece = character
+        elif ord(character) < 0x100:
+            piece = f"\\x{ord(character):02x}"
+        else:
+            piece = f"\\u{ord(character):04x}"
+        if length + len(piece) > _MAX_RENDERED_NAME:
+            rendered.append(_RENDERED_NAME_ELLIPSIS)
+            break
+        rendered.append(piece)
+        length += len(piece)
+    return "".join(rendered)
 
 
 class ConfigError(Exception):
@@ -57,7 +97,10 @@ class ConfigError(Exception):
     - caso contrário: ``Erro de configuração em '<field>': <reason>``. Vale
       também para a chave desconhecida que por acaso se chame
       ``SMTP_USERNAME`` ou ``SMTP_PASSWORD``: ela é rejeitada como chave
-      desconhecida, e a mensagem não pode anunciar credencial ausente.
+      desconhecida, e a mensagem não pode anunciar credencial ausente. O nome do
+      campo é reproduzido por :func:`_render_document_name`, de modo que uma
+      chave estranha não copia uma linha do arquivo para o diagnóstico; ``field``
+      continua guardando o nome original.
     """
 
     def __init__(
@@ -77,7 +120,8 @@ class ConfigError(Exception):
             return f"Erro de configuração: {self.reason}"
         if self._credencial:
             return f"Credencial ausente: variável {self.field} {self.reason}."
-        return f"Erro de configuração em '{self.field}': {self.reason}"
+        name = _render_document_name(self.field)
+        return f"Erro de configuração em '{name}': {self.reason}"
 
 
 @dataclass(frozen=True)
@@ -104,11 +148,12 @@ class Config:
 class Credentials:
     """Par usuário/senha de SMTP, lido somente de variáveis de ambiente.
 
-    ``password`` fica fora de ``repr`` para que nenhuma representação do objeto
-    carregue o segredo.
+    ``username`` e ``password`` ficam fora de ``repr`` para que nenhuma
+    representação do objeto carregue os valores: o usuário é um endereço de
+    e-mail e a senha é a credencial de autenticação.
     """
 
-    username: str
+    username: str = field(repr=False)
     password: str = field(repr=False)
 
 
@@ -162,7 +207,7 @@ def load_credentials(environ: Mapping[str, str] | None = None) -> Credentials:
         environ: Mapeamento a consultar. ``None`` usa ``os.environ``.
 
     Returns:
-        As credenciais, com a senha fora de ``repr``.
+        As credenciais, com o usuário e a senha fora de ``repr``.
 
     Raises:
         ConfigError: ``SMTP_USERNAME`` ou ``SMTP_PASSWORD`` ausente, vazia ou
@@ -263,9 +308,10 @@ def _walk_repeated_keys(node: yaml.Node | None, visited: set[int]) -> None:
             if isinstance(key_node, yaml.ScalarNode):
                 if key_node.value in seen:
                     line = key_node.start_mark.line + 1
+                    name = _render_document_name(key_node.value)
                     raise ConfigError(
                         None,
-                        f"chave '{key_node.value}' repetida na linha {line}.",
+                        f"chave '{name}' repetida na linha {line}.",
                     )
                 seen.add(key_node.value)
             _walk_repeated_keys(value_node, visited)
@@ -315,6 +361,25 @@ def _type_label(value: object) -> str:
     return type(value).__name__
 
 
+def _has_control_character(value: str) -> bool:
+    """Diz se o texto traz C0 (0x00-0x1f), DEL (0x7f) ou C1 (0x80-0x9f).
+
+    Esses caracteres não são espaço: passariam pela validação e seriam escritos
+    crus nos cabeçalhos MIME e no resumo de ``check-config``, onde um ``\\n``
+    forja uma linha nova. Todo caractere imprimível, acentuado ou não, passa.
+
+    Args:
+        value: texto que veio do documento de configuração.
+
+    Returns:
+        ``True`` quando há ao menos um caractere de controle.
+    """
+    return any(
+        ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    )
+
+
 def _bare_address(value: str) -> str | None:
     candidate = value.strip()
     display_name, address = parseaddr(candidate)
@@ -324,6 +389,10 @@ def _bare_address(value: str) -> str | None:
     if not separator or "@" in domain or not local or not domain:
         return None
     if any(character.isspace() for character in candidate):
+        return None
+    # Um C0/DEL/C1 que não é espaço passa por ``parseaddr`` e chegaria cru ao
+    # cabeçalho MIME e ao resumo do ``check-config``, que não escapam controle.
+    if _has_control_character(candidate):
         return None
     return candidate
 
@@ -458,6 +527,14 @@ def _parse_smtp(root: Mapping[str, object]) -> SmtpConfig:
     host = host.strip()
     if not host:
         raise ConfigError("smtp.host", "host vazio.")
+    # Um espaço em volta é removido pelo ``strip`` acima e não chega ao resumo do
+    # ``check-config``; um caractere de controle no meio dividiria a linha dele.
+    if _has_control_character(host):
+        raise ConfigError(
+            "smtp.host",
+            "host inválido (esperado o nome do servidor SMTP, sem caracteres "
+            "de controle).",
+        )
     return SmtpConfig(host=host, port=_parse_port(raw.get("port", _AUSENTE)))
 
 
@@ -519,4 +596,3 @@ def _required_variable(environ: Mapping[str, str], name: str) -> str:
     if not value.strip():
         raise ConfigError(name, "vazia", credencial=True)
     return value
-

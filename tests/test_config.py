@@ -200,6 +200,9 @@ def test_recipients_ausentes_levantam_config_error(config_writer: Callable[..., 
             "sem nome de exibição",
             id="com-nome-de-exibicao",
         ),
+        pytest.param({"recipients": ["a@b\x00.com"]}, "endereço inválido", id="com-nul"),
+        pytest.param({"recipients": ["a@b\x7f.com"]}, "endereço inválido", id="com-del"),
+        pytest.param({"recipients": ["a@b\x9b.com"]}, "endereço inválido", id="com-c1"),
         pytest.param(
             {"recipients": "a@b.com"},
             "deve ser uma lista de endereços, recebido texto",
@@ -236,6 +239,8 @@ def test_sender_ausente_levanta_config_error(config_writer: Callable[..., Path])
         pytest.param("invalido", "endereço inválido", id="sem-arroba"),
         pytest.param("Nome <a@b.com>", "sem nome de exibição", id="com-nome-de-exibicao"),
         pytest.param("", "remetente ausente", id="em-branco"),
+        pytest.param("a@b\x00.com", "endereço inválido", id="com-nul"),
+        pytest.param("a@b\x7f.com", "endereço inválido", id="com-del"),
     ],
 )
 def test_sender_invalido_levanta_config_error(
@@ -257,6 +262,14 @@ def test_sender_invalido_levanta_config_error(
     [
         pytest.param({"smtp": {"host": ""}}, "host vazio", id="host-vazio"),
         pytest.param({"smtp": {"host": "   "}}, "host vazio", id="host-em-branco"),
+        pytest.param(
+            {"smtp": {"host": "smtp.exemplo.com\nx: forjado"}},
+            "host inválido",
+            id="host-com-quebra-de-linha",
+        ),
+        pytest.param(
+            {"smtp": {"host": "smtp.exemplo.com\x00"}}, "host inválido", id="host-com-nul"
+        ),
     ],
 )
 def test_smtp_host_invalido_levanta_config_error(
@@ -268,6 +281,22 @@ def test_smtp_host_invalido_levanta_config_error(
     message = str(excinfo.value)
     assert "smtp.host" in message
     assert reason in message
+    assert "\n" not in message
+
+
+def test_host_e_destinatario_com_caractere_imprimivel_nao_ascii_continuam_aceitos(
+    config_writer: Callable[..., Path]
+) -> None:
+    """Rejeitar controle não pode estreitar as regras da AAP 0.7.1."""
+    config = load_config(
+        config_writer(
+            recipients=["usuário@exemplo.invalid"],
+            smtp={"host": "smtp.exémplo.com"},
+        )
+    )
+
+    assert config.recipients == ("usuário@exemplo.invalid",)
+    assert config.smtp.host == "smtp.exémplo.com"
 
 
 def test_smtp_ausente_levanta_config_error_citando_o_host(
@@ -391,6 +420,45 @@ def test_credencial_no_bloco_smtp_e_rejeitada_como_chave_desconhecida(
     message = str(excinfo.value)
     assert "password" in message
     assert sentinel_password not in message
+
+
+def test_chave_desconhecida_comum_e_nomeada_intacta(
+    config_writer: Callable[..., Path]
+) -> None:
+    """Uma chave plausível continua aparecendo como o operador a escreveu (AAP 0.7.1)."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_writer(smtp_password="x"))
+
+    message = str(excinfo.value)
+    assert message.startswith("Erro de configuração em 'smtp_password': chave desconhecida")
+    assert "válidas neste nível: recipients, sender, smtp, tickers, timezone" in message
+    assert "\n" not in message
+
+
+@pytest.mark.parametrize(
+    ("key", "rendered"),
+    [
+        pytest.param(
+            "root:*:20751:0:99999:7:::",
+            "root\\x3a\\x2a\\x3a20751\\x3a0\\x3a99999\\x3a7…",
+            id="forma-de-shadow",
+        ),
+        pytest.param("k" * 200, "k" * 40 + "…", id="200-caracteres"),
+    ],
+)
+def test_chave_desconhecida_estranha_nao_escreve_o_documento_no_diagnostico(
+    config_writer: Callable[..., Path], key: str, rendered: str
+) -> None:
+    """Só alfanuméricos, ``_``, ``-`` e ``.`` passam: um nome alheio vira escape curto."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_writer(**{key: 1}))
+
+    message = str(excinfo.value)
+    assert excinfo.value.field == key
+    assert key not in message
+    assert f"Erro de configuração em '{rendered}': chave desconhecida" in message
+    assert "válidas neste nível: recipients, sender, smtp, tickers, timezone" in message
+    assert "\n" not in message
 
 
 @pytest.mark.parametrize("variable", ["SMTP_USERNAME", "SMTP_PASSWORD"])
@@ -635,6 +703,24 @@ def test_chave_duplicada_no_mesmo_mapeamento_e_rejeitada(
     assert f"chave '{key}' repetida na linha {line}" in message
 
 
+def test_nome_repetido_longo_nao_escreve_o_documento_no_diagnostico(
+    config_writer: Callable[..., Path]
+) -> None:
+    """O motivo da chave repetida também reproduz o nome vindo do documento."""
+    key = "host:" * 40
+    path = config_writer(raw=f"'{key}': 1\n'{key}': 2\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert key not in message
+    assert message.startswith("Erro de configuração: chave '")
+    assert message.endswith("repetida na linha 2.")
+    assert "…" in message
+    assert "\n" not in message
+
+
 def test_tag_python_no_arquivo_continua_recusada(
     config_writer: Callable[..., Path]
 ) -> None:
@@ -778,16 +864,19 @@ def test_load_credentials_le_so_o_mapeamento_recebido(
     assert "SMTP_USERNAME" in str(excinfo.value)
 
 
-def test_repr_e_str_de_credentials_nao_expoem_a_senha(
+def test_repr_e_str_de_credentials_nao_expoem_os_valores(
     sentinel_username: str, sentinel_password: str
 ) -> None:
+    """Nem ``repr`` nem ``str`` do objeto carregam o usuário ou a senha."""
     credentials = load_credentials(
         {"SMTP_USERNAME": sentinel_username, "SMTP_PASSWORD": sentinel_password}
     )
 
+    assert "Credentials(" in repr(credentials)
+    assert sentinel_username not in repr(credentials)
     assert sentinel_password not in repr(credentials)
+    assert sentinel_username not in str(credentials)
     assert sentinel_password not in str(credentials)
-    assert sentinel_username in repr(credentials)
 
 
 # --- Imutabilidade ---------------------------------------------------------
