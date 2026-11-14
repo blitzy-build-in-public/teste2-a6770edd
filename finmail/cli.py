@@ -186,13 +186,13 @@ def handle_run(config: finmail_config.Config, dry_run: bool) -> int:
     report = build(entries, now=datetime.now(tz=config.timezone))
 
     if dry_run:
+        _LOGGER.info(
+            "Imprimindo o resumo de %s no terminal (--dry-run); nenhum e-mail foi enviado.",
+            _count(successes, "ativo", "ativos"),
+        )
         print(f"Assunto: {report.subject}")
         print(_DRY_RUN_DELIMITER)
         print(report.text, end="" if report.text.endswith("\n") else "\n")
-        _LOGGER.info(
-            "Resumo de %s impresso no terminal (--dry-run); nenhum e-mail foi enviado.",
-            _count(successes, "ativo", "ativos"),
-        )
         return EXIT_OK
 
     from finmail import mailer
@@ -368,11 +368,14 @@ class _OperatorFormatter(logging.Formatter):
 
 
 def _timezone_converter(timezone: ZoneInfo | None) -> Callable[[float], datetime]:
-    """Conversor de instante do formatador: ``float`` → ``datetime`` no fuso dado.
+    """Conversor de instante do formatador: ``float`` → ``datetime`` ciente do fuso.
 
-    Um ``ZoneInfo`` ausente produz ``datetime`` local sem fuso, e então ``%z``
-    sai vazio — o caso das linhas gravadas antes de a configuração ser lida.
+    O ``datetime`` devolvido sempre carrega o deslocamento, então ``%z`` nunca sai
+    vazio: com ``ZoneInfo`` vale o fuso do operador e, sem ele — o caso das linhas
+    gravadas antes de a configuração ser lida —, o deslocamento local do host.
     """
+    if timezone is None:
+        return lambda timestamp: datetime.fromtimestamp(timestamp).astimezone()
     return lambda timestamp: datetime.fromtimestamp(timestamp, timezone)
 
 

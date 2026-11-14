@@ -206,6 +206,7 @@ o corpo texto completo. O corpo HTML não é impresso, para manter a saída leg�
 
 ```text
 2026-11-13T20:29:59-0300 INFO finmail: Comando 'run' com a configuração '/home/operador/finmail/config.yaml' (2 ativos).
+2026-11-13T20:29:59-0300 INFO finmail: Imprimindo o resumo de 2 ativos no terminal (--dry-run); nenhum e-mail foi enviado.
 Assunto: Resumo de mercado – 2026-11-13
 --- corpo texto ---
 Resumo de mercado – 2026-11-13
@@ -213,7 +214,6 @@ Ativo | Nome | Moeda | Data | Fechamento | Variação | Variação % | Volume | 
 AAPL | Apple Inc. | USD | 2026-11-13 | 356,27 | +1,39 | +0,39% | 39.099.985 | 243,42 | 360,83 | ok
 PETR4.SA | Petróleo Brasileiro S.A. - Petrobras | BRL | 2026-11-13 | 45,30 | +0,60 | +1,34% | 23.431.100 | 29,53 | 59,79 | ok
 Dados fornecidos pelo Yahoo Finance. Os valores podem apresentar atraso.
-2026-11-13T20:29:59-0300 INFO finmail: Resumo de 2 ativos impresso no terminal (--dry-run); nenhum e-mail foi enviado.
 ```
 
 O assunto é `Resumo de mercado – AAAA-MM-DD`, com travessão EN (U+2013), e a data é a **data da execução** no

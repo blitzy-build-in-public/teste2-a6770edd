@@ -219,6 +219,35 @@ def credentials(username: str, password: str) -> Credentials:
     return Credentials(username=username, password=password)
 
 
+def capture_product_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Leva os registros do produto até o ``caplog``, qualquer que seja a ordem.
+
+    ``cli._configure_logging`` fixa ``propagate = False`` no logger ``finmail``
+    para que o log do produto tenha um formato único (AAP 0.6.2), e esse valor
+    sobrevive ao teste que chamou ``cli.main``. Como ``test_cli.py`` é coletado
+    antes deste arquivo, os registros de ``finmail.mailer`` deixariam de alcançar
+    o logger raiz, onde o ``caplog`` os recolhe, e as asserções de ausência da
+    senha percorreriam um log vazio sem provar nada. O helper devolve a
+    propagação só durante o teste (``monkeypatch`` restaura o valor de produção
+    ao final), fixa o nível do logger do produto, confirma com uma sonda que a
+    captura está viva e descarta a sonda, de modo que os registros que o teste
+    examina sejam apenas os emitidos pelo produto.
+    """
+    monkeypatch.setattr(logging.getLogger("finmail"), "propagate", True)
+    caplog.set_level(logging.DEBUG, logger="finmail")
+
+    probe = "sonda de captura do log do produto"
+    logging.getLogger("finmail.mailer").warning(probe)
+    assert any(record.getMessage() == probe for record in caplog.records), (
+        "o caplog não recebeu a sonda: sem captura viva, as asserções de sigilo "
+        "que seguem não provariam nada"
+    )
+    caplog.clear()
+
+
 # --- Estrutura MIME (AAP 0.2.1 e 0.5.4) ----------------------------------------
 
 
@@ -539,7 +568,7 @@ def test_senha_nao_aparece_na_mensagem_de_erro(
     sentinel_password: str,
 ) -> None:
     """Autenticação recusada: o código aparece, a senha não, em saída nem em log."""
-    caplog.set_level(logging.DEBUG)
+    capture_product_logs(monkeypatch, caplog)
     error = smtplib.SMTPAuthenticationError(535, b"5.7.8 bad credentials")
     install_fake_smtp(monkeypatch, failure_script("login", error))
     patch_sleep(monkeypatch)
@@ -571,7 +600,7 @@ def test_falha_4xx_persistente_nomeia_o_servidor_sem_expor_credenciais(
     sentinel_password: str,
 ) -> None:
     """O aviso de cada nova tentativa cita host, porta e código, nunca a credencial."""
-    caplog.set_level(logging.DEBUG)
+    capture_product_logs(monkeypatch, caplog)
     error = smtplib.SMTPDataError(451, b"4.3.0 try later")
     install_fake_smtp(monkeypatch, failure_script("send_message", error))
     patch_sleep(monkeypatch)
@@ -590,6 +619,8 @@ def test_falha_4xx_persistente_nomeia_o_servidor_sem_expor_credenciais(
     assert sentinel_password not in text
     assert sentinel_username not in caplog.text
     assert sentinel_password not in caplog.text
+    # As duas tentativas recusadas deixam um WARNING cada: a captura precisa tê-los.
+    assert caplog.records
     for record in caplog.records:
         assert sentinel_password not in record.getMessage()
         assert sentinel_password not in repr(record.args)

@@ -22,6 +22,7 @@ descritor de arquivo lê com confiança o que ele escreveu.
 """
 
 import re
+import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -53,14 +54,13 @@ TICKERS_COM_FALHA = ["AAPL", "PETR4.SA", "BTC-USD"]
 MOTIVO_DA_FALHA = "falha de rede após 3 tentativas"
 
 # Linha de log no formato único de AAP 0.6.2: data ISO-8601, nível, nome do logger
-# e mensagem. O deslocamento de fuso é opcional porque as linhas gravadas antes de
-# a configuração ser lida — a falha do próprio arquivo — ainda não têm fuso.
+# e mensagem. Toda linha carrega o deslocamento de fuso, inclusive a da falha de
+# configuração, gravada antes de a configuração ser lida.
 LOG_LINE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{4})? "
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} "
     r"(DEBUG|INFO|WARNING|ERROR) finmail: "
 )
-# Deslocamento de fuso explícito, exigido das linhas gravadas depois que o fuso do
-# operador é conhecido.
+# Deslocamento de fuso explícito, exigido de toda linha de log (AAP 0.6.2).
 ZONE_OFFSET = re.compile(r"T\d{2}:\d{2}:\d{2}[+-]\d{4} ")
 
 
@@ -243,7 +243,7 @@ def test_help_sai_com_0_e_lista_os_dois_comandos(
         pytest.param(("run", "--nao-existe"), "--nao-existe", id="opcao-desconhecida"),
     ],
 )
-def test_erro_de_uso_sai_com_3_e_nomeia_o_argumento(
+def test_uso_invalido_sai_com_3(
     run_finmail: Any,
     arguments: tuple[str, ...],
     offender: str,
@@ -646,7 +646,7 @@ def test_dry_run_imprime_assunto_e_corpo_texto_sem_html(
     subject = subject_line.removeprefix("Assunto: ")
     assert subject.startswith("Resumo de mercado – ")
     body = out.split("--- corpo texto ---\n", 1)[1]
-    # As linhas de log que cercam o bloco não fazem parte do corpo do e-mail.
+    # As linhas de log vêm antes do bloco: nada de log depois do corpo do e-mail.
     lines = [line for line in body.splitlines() if not LOG_LINE.match(line)]
     # Uma linha por ativo, na ordem da configuração, entre o cabeçalho e o rodapé.
     assert lines[0] == subject
@@ -655,6 +655,8 @@ def test_dry_run_imprime_assunto_e_corpo_texto_sem_html(
         assert lines[position].startswith(f"{ticker} | ")
     assert lines[len(configured) + 2] == report_module.FOOTER
     assert len(lines) == len(configured) + 3
+    # O bloco delimitado fecha a saída: o rodapé é a última coisa em ``stdout``.
+    assert out.rstrip("\n").endswith(report_module.FOOTER)
 
 
 def test_dry_run_mostra_dados_indisponiveis_e_sai_com_0(
@@ -808,7 +810,7 @@ CHECK_CONFIG_PROBE = (
 )
 
 
-def test_check_config_nao_carrega_yfinance_nem_os_adaptadores(
+def test_check_config_nao_importa_yfinance(
     run_python: Any,
     config_writer: Any,
 ) -> None:
@@ -824,7 +826,7 @@ def test_check_config_nao_carrega_yfinance_nem_os_adaptadores(
     assert subprocess_field(result.stdout, "MOD_MAILER") == "False"
 
 
-def test_check_config_sem_recipients_sai_com_3_no_processo(
+def test_check_config_sem_recipients_sai_com_3(
     run_finmail: Any,
     config_writer: Any,
 ) -> None:
@@ -871,7 +873,7 @@ def test_o_localizador_de_segredo_encontra_um_vazamento_de_verdade(
     assert_absent({"stdout": "linha sem segredo", "stderr": ""}, sentinel_password)
 
 
-def test_o_valor_sentinela_nao_aparece_em_nenhuma_saida(
+def test_sentinela_de_senha_ausente_de_todas_as_saidas(
     monkeypatch: pytest.MonkeyPatch,
     config_writer: Any,
     sentinel_username: str,
@@ -948,3 +950,36 @@ def test_dry_run_nao_carrega_o_mailer_e_nao_abre_conexao_smtp(
     assert subprocess_field(result.stdout, "MOD_SMTPLIB") == "False"
     assert "--- corpo texto ---" in result.stdout
     assert "<html" not in result.stdout
+
+
+# Restrição proibitiva "Somente as dependências listadas" (AAP 0.9, tabela de
+# restrições): a verificação designada é esta inspeção do manifesto, que confere os
+# pins exatos da AAP 0.4.1 e a ausência de ``[project.scripts]`` da AAP 0.6.3.
+
+MANIFEST_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
+
+# Pins exatos por grupo de declaração do manifesto. A comparação por igualdade de
+# conjunto é o que exclui faixa de versão, ``latest`` e pacote acrescentado.
+RUNTIME_PINS = frozenset({"yfinance==0.2.66", "pandas==2.3.3", "PyYAML==6.0.3", "Jinja2==3.1.6"})
+DEV_PINS = frozenset({"pytest==8.4.2", "aiosmtpd==1.4.6"})
+BUILD_PINS = frozenset({"setuptools==84.2.1"})
+
+
+def test_manifesto_declara_apenas_as_dependencias_listadas() -> None:
+    """O manifesto declara só as dependências listadas, em versão exata.
+
+    O ``tomllib`` da biblioteca padrão lê o ``pyproject.toml`` sem dependência nova.
+    Cada conjunto de declarações é comparado por igualdade com os pins da AAP 0.4.1,
+    e o manifesto não pode trazer ``[project.scripts]``.
+    """
+    manifest = tomllib.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    project: Any = manifest["project"]
+    build_system: Any = manifest["build-system"]
+
+    assert set(project["dependencies"]) == RUNTIME_PINS
+    assert set(project["optional-dependencies"]) == {"dev"}
+    assert set(project["optional-dependencies"]["dev"]) == DEV_PINS
+    assert set(build_system["requires"]) == BUILD_PINS
+    # Um console script criaria uma segunda forma de invocação ao lado de
+    # ``python -m finmail``, que é a única que a AAP 0.6.3 fixa.
+    assert "scripts" not in project

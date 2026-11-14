@@ -371,8 +371,11 @@ def test_dry_run_nao_abre_conexao_smtp(
     assert DRY_RUN_DELIMITER in lines, describe(proc)
     assert lines.index(DRY_RUN_DELIMITER) > lines.index(subject_lines[0])
     body = proc.stdout.split(DRY_RUN_DELIMITER + "\n", 1)[1]
-    # O corpo termina no rodapé; a linha de log que o segue não faz parte dele.
+    # O corpo termina no rodapé, que fecha o bloco e a saída do comando.
     body = body[: body.index(FOOTER) + len(FOOTER)]
+    # A ordem do AAP 0.6.2 vale no processo real: o bloco delimitado é a última
+    # coisa em ``stdout``, sem nenhuma linha de log depois dele.
+    assert proc.stdout.rstrip("\n").endswith(FOOTER), describe(proc)
 
     assert body.splitlines()[0] == subject
     rows = asset_lines(body)
