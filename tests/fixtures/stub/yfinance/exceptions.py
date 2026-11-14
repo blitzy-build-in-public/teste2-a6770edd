@@ -9,9 +9,11 @@ class YFRateLimitError(Exception):
     """Limite de requisições do Yahoo (HTTP 429); falha repetível."""
 
 
-class YFPricesMissingError(Exception):
-    """Sem barras de preço utilizáveis para o símbolo; erro determinístico, não repetido."""
-
-
 class YFTickerMissingError(Exception):
     """O símbolo não resolve no Yahoo; erro determinístico, não repetido."""
+
+
+# Herda de YFTickerMissingError como na biblioteca real: a ordem das cláusulas ``except`` de
+# ``finmail/quotes.py`` depende dessa hierarquia.
+class YFPricesMissingError(YFTickerMissingError):
+    """Sem barras de preço utilizáveis para o símbolo; erro determinístico, não repetido."""

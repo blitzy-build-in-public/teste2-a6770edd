@@ -664,6 +664,116 @@ def test_aviso_de_depreciacao_do_yfinance_nao_chega_ao_stderr(
     assert warnings.filters[0] == proprios[0]
 
 
+# Codificação dos streams: a saída pt-BR não depende do locale do host (AAP 0.6.2).
+# ``PYTHONIOENCODING`` define o codec do processo antes de o produto rodar; o resumo
+# acentuado de ``check-config`` e o travessão do assunto só saem porque ``main`` fixa
+# os dois streams em UTF-8, e o código de saída continua sendo o do desfecho.
+
+
+def test_check_config_imprime_o_resumo_acentuado_com_stdout_fora_de_utf8(
+    run_finmail: Any,
+    config_writer: Any,
+) -> None:
+    """Com ``PYTHONIOENCODING=ascii``, o resumo acentuado sai e o código é ``0``."""
+    path = config_writer()
+
+    result = run_finmail(
+        "check-config",
+        "--config",
+        str(path),
+        env={"PYTHONIOENCODING": "ascii"},
+    )
+
+    assert result.returncode == cli.EXIT_OK
+    assert result.stderr == ""
+    assert "Configuração válida." in result.stdout
+    assert "SMTP_PASSWORD: não definido" in result.stdout
+    # A linha de log de início também é acentuada, o que prova o mesmo caminho
+    # pelo handler que escreve em ``sys.stdout``.
+    assert any("configuração" in line for line in log_lines(result.stdout))
+
+
+def test_dry_run_imprime_o_travessao_do_assunto_com_stdout_fora_de_utf8(
+    run_finmail: Any,
+    config_writer: Any,
+) -> None:
+    """O travessão do assunto (U+2013) sai mesmo com ``PYTHONIOENCODING=ascii``."""
+    path = config_writer()
+
+    result = run_finmail(
+        "run",
+        "--dry-run",
+        "--config",
+        str(path),
+        env={"PYTHONIOENCODING": "ascii"},
+    )
+
+    assert result.returncode == cli.EXIT_OK
+    assert result.stderr == ""
+    assert "--- corpo texto ---" in result.stdout
+    subject_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("Assunto: ")
+    )
+    assert subject_line.startswith("Assunto: Resumo de mercado – ")
+
+
+# Interrupção do operador e pipe de ``stdout`` fechado: os dois desfechos que o mapa
+# de códigos não classifica por si entram no código de falha não classificada, e
+# ``stderr`` continua com uma única linha (AAP 0.6.2, disciplina de streams).
+
+INTERRUPT_PROBE = (
+    "import sys\n"
+    "import finmail.cli\n"
+    "import finmail.quotes\n"
+    "def interrupt(ticker):\n"
+    "    raise KeyboardInterrupt()\n"
+    "finmail.quotes.fetch = interrupt\n"
+    "raise SystemExit(finmail.cli.main(['run', '--dry-run', '--config', sys.argv[1]]))\n"
+)
+
+CLOSED_STDOUT_PROBE = (
+    "import os\n"
+    "import sys\n"
+    "import finmail.cli\n"
+    "read_fd, write_fd = os.pipe()\n"
+    "os.close(read_fd)\n"
+    "os.dup2(write_fd, 1)\n"
+    "os.close(write_fd)\n"
+    "raise SystemExit(finmail.cli.main(['check-config', '--config', sys.argv[1]]))\n"
+)
+
+
+def test_interrupcao_do_operador_sai_com_1_e_um_diagnostico_unico(
+    run_python: Any,
+    config_writer: Any,
+) -> None:
+    """``KeyboardInterrupt`` vira ``1`` com uma linha em ``stderr``, sem traceback."""
+    path = config_writer()
+
+    result = run_python(INTERRUPT_PROBE, str(path))
+
+    assert result.returncode == cli.EXIT_UNEXPECTED
+    assert len(result.stderr.splitlines()) == 1
+    assert "interrompida" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_pipe_de_stdout_fechado_sai_com_1_sem_ruido_em_stderr(
+    run_python: Any,
+    config_writer: Any,
+) -> None:
+    """Com o leitor do pipe fechado, a execução termina em ``1`` e sem traceback."""
+    path = config_writer()
+
+    result = run_python(CLOSED_STDOUT_PROBE, str(path))
+
+    assert result.returncode == cli.EXIT_UNEXPECTED
+    assert len(result.stderr.splitlines()) == 1
+    assert "--- Logging error ---" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "Exception ignored" not in result.stderr
+
+
 # ``run --dry-run``: assunto e corpo texto, sem HTML e sem SMTP (AAP 0.6.2, critério 4).
 
 

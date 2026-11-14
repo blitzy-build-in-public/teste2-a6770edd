@@ -14,7 +14,9 @@ Os adaptadores entram sob demanda: ``quotes`` e ``report`` dentro de
 impresso por ``--dry-run``; ``stderr`` recebe apenas as mensagens de uso do
 ``argparse`` e uma linha de diagnóstico por falha fatal. Nenhum valor de
 ``SMTP_USERNAME`` ou ``SMTP_PASSWORD`` é impresso, registrado ou interpolado em
-mensagem de exceção.
+mensagem de exceção. Os dois streams são fixados em UTF-8 no início de
+:func:`main`, para que nem o resumo acentuado nem o travessão do assunto dependam
+do locale do host.
 """
 
 import argparse
@@ -87,20 +89,67 @@ class FinmailArgumentParser(argparse.ArgumentParser):
 def main(argv: list[str] | None = None) -> int:
     """Executa um comando e devolve o código de saída do processo.
 
-    É a única raiz de composição: valida a configuração antes de qualquer I/O de
-    rede, registra a linha de início e entrega o comando ao handler
-    correspondente. Uma falha esperada nunca escapa como exceção — cada desfecho
-    vira um código de saída, com uma linha de diagnóstico em ``stderr`` e um
-    ``ERROR`` no log.
+    É a única raiz de composição: fixa a codificação dos streams, entrega o comando
+    a :func:`_dispatch` e descarrega a saída padrão antes do fim do processo. Uma
+    falha esperada nunca escapa como exceção — cada desfecho vira um código de
+    saída, com uma linha de diagnóstico em ``stderr`` e um ``ERROR`` no log. Os dois
+    desfechos que o mapa de códigos não classifica por si, a interrupção do operador
+    e o fechamento do pipe por quem lia ``stdout``, entram no código de falha não
+    classificada.
 
     Args:
         argv: argumentos da linha de comando sem o nome do programa. ``None`` usa
             ``sys.argv[1:]``, como ``python -m finmail`` fornece.
 
     Returns:
-        ``0`` em sucesso, ``1`` em defeito inesperado, ``2`` quando nenhum ativo
-        retornou dados, ``3`` em erro de configuração ou de uso e ``4`` em falha
-        de SMTP depois das tentativas.
+        ``0`` em sucesso, ``1`` em defeito inesperado — inclusive quando o operador
+        interrompe a execução ou o leitor de ``stdout`` fecha o pipe —, ``2`` quando
+        nenhum ativo retornou dados, ``3`` em erro de configuração ou de uso e ``4``
+        em falha de SMTP depois das tentativas.
+
+    Raises:
+        SystemExit: apenas no erro de uso do ``argparse``, que
+            :class:`FinmailArgumentParser` encerra com ``EXIT_CONFIG``.
+    """
+    _configure_stream_encoding()
+    try:
+        code = _dispatch(argv)
+    except KeyboardInterrupt:
+        if not _LOGGER.handlers:
+            # Uma interrupção que chega antes de ``_dispatch`` configurar o log: sem
+            # handler, o ``lastResort`` repetiria a linha em ``stderr``.
+            _configure_logging()
+        _fatal("Execução interrompida pelo operador.")
+        code = EXIT_UNEXPECTED
+    if not _flush_stdout() and code == EXIT_OK:
+        # A causa não é nomeada aqui de propósito: o descarrego também falha por um
+        # erro do sistema de arquivos, e culpar o leitor do pipe mentiria para o cron.
+        _fatal(
+            "Saída padrão interrompida: a escrita em stdout falhou e a saída do "
+            "comando ficou incompleta."
+        )
+        code = EXIT_UNEXPECTED
+    return code
+
+
+def _dispatch(argv: list[str] | None) -> int:
+    """Interpreta a linha de comando, valida a configuração e entrega o comando.
+
+    Concentra o corpo da execução: monta o parser, configura o log, lê a
+    configuração, registra a linha de início e chama o handler do comando, com um
+    classificador por desfecho esperado. Não trata a interrupção do operador nem o
+    fechamento de ``stdout``, que ficam em :func:`main`, e não toca nos streams.
+
+    Args:
+        argv: argumentos da linha de comando sem o nome do programa.
+
+    Returns:
+        O código de saída do desfecho: ``EXIT_OK``, ``EXIT_UNEXPECTED``,
+        ``EXIT_ALL_QUOTES_FAILED``, ``EXIT_CONFIG`` ou ``EXIT_SMTP``.
+
+    Raises:
+        KeyboardInterrupt: quando o operador interrompe a execução.
+        SystemExit: no erro de uso do ``argparse``, com ``EXIT_CONFIG``.
     """
     parser = _build_parser()
     _configure_logging()
@@ -129,9 +178,10 @@ def main(argv: list[str] | None = None) -> int:
     except finmail_config.ConfigError as exc:
         _fatal(str(exc))
         return EXIT_CONFIG
-    except Exception as exc:  # noqa: BLE001 - classificador final do processo
-        # Defeito inesperado: o traceback é permitido aqui porque nenhuma
-        # mensagem do produto interpola credencial.
+    except Exception as exc:
+        # Captura ampla de propósito: este é o classificador final do processo e é o
+        # que converte um defeito inesperado no código de saída 1. O traceback é
+        # permitido aqui porque nenhuma mensagem do produto interpola credencial.
         _LOGGER.exception("falha inesperada durante a execução")
         print(f"falha inesperada: {exc}", file=sys.stderr)
         return EXIT_UNEXPECTED
@@ -322,6 +372,31 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_stream_encoding() -> None:
+    """Fixa ``stdout`` e ``stderr`` em UTF-8, qualquer que seja o locale do host.
+
+    A saída do produto é pt-BR: o resumo de ``check-config``, o assunto com travessão
+    e as linhas de log carregam acentos e pontuação que um stream configurado pelo
+    ambiente — ``PYTHONIOENCODING=ascii``, um locale POSIX sem a coerção do PEP 538,
+    o ``cron`` do macOS — recusaria com ``UnicodeEncodeError``. Fixar UTF-8 aqui faz o
+    contrato de streams não depender do host, e ``backslashreplace`` garante que uma
+    escrita nunca falhe por um caractere que o destino não represente.
+
+    Um stream substituído por objeto sem ``reconfigure``, como o ``StringIO`` de um
+    teste, é deixado como está; um stream já fechado ou desanexado, que levanta
+    ``ValueError`` ou ``OSError``, é ignorado em vez de interromper a execução.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError):
+            # Stream fechado ou desanexado: não há o que reconfigurar.
+            continue
+
+
 def _configure_logging(timezone: ZoneInfo | None = None) -> None:
     """Configura o logger do produto para escrever em ``stdout``.
 
@@ -381,9 +456,86 @@ def _stdout_handler(logger: logging.Logger) -> logging.StreamHandler:
     for handler in logger.handlers:
         if isinstance(handler, logging.StreamHandler):
             return handler
-    handler = logging.StreamHandler(sys.stdout)
+    handler = _StdoutHandler(sys.stdout)
     logger.addHandler(handler)
     return handler
+
+
+def _flush_stdout() -> bool:
+    """Descarrega ``stdout`` e diz se a saída do comando chegou inteira ao destino.
+
+    Um leitor que fecha o pipe antes do fim da execução faz a próxima escrita
+    levantar ``BrokenPipeError``; sem tratamento, o interpretador ainda imprime
+    ``Exception ignored in: <_io.TextIOWrapper ...>`` na finalização e sai com um
+    código que o mapa do produto não tem. A saída documentada para esse caso é
+    abandonar o descritor — :func:`_abandon_stdout` — e deixar o desfecho ser
+    classificado como falha. Um stream já fechado, que levanta ``ValueError``, e um
+    erro de escrita do sistema operacional caem no mesmo tratamento.
+
+    Returns:
+        ``True`` quando a saída foi descarregada por inteiro; ``False`` quando não
+        foi possível descarregá-la e ``stdout`` teve de ser abandonado.
+    """
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        _abandon_stdout()
+        return False
+    return True
+
+
+def _abandon_stdout() -> None:
+    """Aponta o descritor de ``sys.stdout`` para ``os.devnull``.
+
+    É o remédio documentado para o pipe fechado: as escritas que restarem — inclusive
+    o ``flush`` que o interpretador faz na finalização — passam a ter um destino
+    válido, de modo que o processo termina com o código de saída do desfecho e sem
+    ``Exception ignored`` em ``stderr``. Um stream sem descritor utilizável não tem o
+    que redirecionar e é deixado como está.
+    """
+    fileno = getattr(sys.stdout, "fileno", None)
+    if fileno is None:
+        return
+    try:
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(null_fd, fileno())
+    except (OSError, ValueError):
+        # Descritor já fechado ou sem suporte a ``fileno``: nada a redirecionar.
+        pass
+    finally:
+        os.close(null_fd)
+
+
+class _StdoutHandler(logging.StreamHandler):
+    """Handler de ``stdout`` que não transforma um pipe fechado em traceback.
+
+    ``stderr`` é reservado à linha única de diagnóstico fatal e às mensagens de uso do
+    ``argparse``, então um leitor que fecha o pipe não pode converter uma linha de log
+    perdida em ``--- Logging error ---`` com traceback. Por isso a escrita é feita
+    aqui, dentro do ``try``: ``BrokenPipeError`` e o ``ValueError`` de um stream já
+    fechado ou descartado são abandonados em silêncio, enquanto todo o resto continua
+    chegando a :meth:`logging.StreamHandler.handleError`, para não esconder um defeito
+    de verdade do formatador. ``RecursionError`` é a exceção que o próprio ``logging``
+    trata como fatal e volta a subir.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Formata ``record`` e o escreve em ``self.stream``, tolerando o pipe fechado."""
+        try:
+            message = self.format(record)
+            self.stream.write(message + self.terminator)
+            self.flush()
+        except (BrokenPipeError, ValueError):
+            # O leitor de stdout fechou o pipe ou o stream já foi fechado: a linha de
+            # log se perde, e é o suficiente — nada de diagnóstico em stderr.
+            pass
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
 
 
 class _OperatorFormatter(logging.Formatter):

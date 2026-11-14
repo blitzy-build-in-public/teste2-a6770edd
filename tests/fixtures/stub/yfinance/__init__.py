@@ -2,7 +2,7 @@
 
 Este pacote é colocado à frente do ``site-packages`` no ``PYTHONPATH`` de cada subprocesso
 de teste, sombreando a biblioteca real do Yahoo Finance, e oferece apenas a superfície que
-``finmail/quotes.py`` usa, com dados fixos e determinísticos.
+``finmail/quotes.py`` usa, com dados fixos e determinísticos e as mesmas colunas da biblioteca.
 """
 
 import pandas as pd
@@ -15,6 +15,7 @@ _COLUMN_DTYPES: dict[str, str] = {
     "High": "float64",
     "Low": "float64",
     "Close": "float64",
+    "Adj Close": "float64",
     "Volume": "int64",
 }
 
@@ -125,6 +126,9 @@ def _build_frame(bars: tuple[_Bar, ...]) -> pd.DataFrame:
             "High": [bar[2] for bar in bars],
             "Low": [bar[3] for bar in bars],
             "Close": [bar[4] for bar in bars],
+            # A biblioteca devolve "Adj Close" com auto_adjust=False; as barras fixas não têm
+            # ajuste de proventos, então o valor acompanha o fechamento.
+            "Adj Close": [bar[4] for bar in bars],
             "Volume": [bar[5] for bar in bars],
         },
         index=index,
@@ -132,7 +136,7 @@ def _build_frame(bars: tuple[_Bar, ...]) -> pd.DataFrame:
 
 
 def _empty_frame() -> pd.DataFrame:
-    """Quadro vazio com as cinco colunas e um ``DatetimeIndex`` vazio chamado ``Date``."""
+    """Quadro vazio com as seis colunas e um ``DatetimeIndex`` vazio chamado ``Date``."""
     index = pd.DatetimeIndex([], name="Date")
     # As séries precisam receber o índice: vazias e sem índice, o construtor do pandas as
     # descarta e o quadro sairia sem coluna alguma.
