@@ -631,6 +631,64 @@ def test_defeito_inesperado_sai_com_1_e_um_diagnostico_unico_em_stderr(
     assert lines_with_level(out, "ERROR")
 
 
+def test_defeito_no_prologo_do_dispatch_sai_com_1_e_um_diagnostico_unico_em_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Um defeito anterior ao handler do comando também vira ``1``, com log em ``stdout``.
+
+    O classificador final fica em ``main``, e não em ``_dispatch``, justamente para
+    cobrir o prólogo: o parser é montado antes de qualquer handler, e uma falha ali
+    escaparia ao interpretador, que imprimiria o traceback em ``stderr`` e deixaria
+    ``stdout`` sem o ``ERROR``. A falha é levantada antes de ``_configure_logging``
+    rodar, então o caso também prova que a captura configura o log antes de registrar a
+    exceção — sem handler, o ``lastResort`` escreveria o traceback no ``stderr``.
+    """
+
+    def explode() -> Any:
+        raise RuntimeError("falha na montagem do parser")
+
+    monkeypatch.setattr(cli, "_build_parser", explode)
+
+    assert cli.main(["check-config"]) == cli.EXIT_UNEXPECTED
+
+    out, err = capture(capfd)
+    assert len(err.splitlines()) == 1
+    assert "falha inesperada" in err
+    assert "falha na montagem do parser" in err
+    assert "Traceback" not in err
+    assert lines_with_level(out, "ERROR")
+    assert "Traceback" in out
+
+
+def test_defeito_na_configuracao_do_log_sai_com_1_e_um_diagnostico_unico_em_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Sem log configurável, ``stderr`` ainda recebe exatamente uma linha de diagnóstico.
+
+    O mesmo defeito que derruba a execução pode impedir ``_configure_logging`` de rodar; e
+    sem handler o ``lastResort`` escreveria o traceback em ``stderr``, dividindo a linha
+    única. A captura final não pode falhar por isso: ela configura o log quando consegue,
+    registra a exceção e imprime a linha de ``stderr`` de qualquer modo.
+    """
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("falha ao configurar o log")
+
+    monkeypatch.setattr(cli, "_configure_logging", explode)
+    logging.getLogger(cli.LOGGER_NAME).handlers.clear()
+
+    assert cli.main(["check-config"]) == cli.EXIT_UNEXPECTED
+
+    out, err = capture(capfd)
+    assert len(err.splitlines()) == 1
+    assert "falha inesperada" in err
+    assert "falha ao configurar o log" in err
+    assert "Traceback" not in err
+    assert "Traceback" not in out
+
+
 # ``cli._configure_logging`` mexe em estado global do processo — o handler do logger do
 # produto (apontado para o ``sys.stdout`` daquele instante), o nível e a propagação dele,
 # os loggers de ``cli.QUIET_LOGGERS``, um handler nulo na raiz e a lista de filtros de

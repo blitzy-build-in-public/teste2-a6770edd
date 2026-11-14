@@ -13,11 +13,12 @@ HTML, a mensagem única endereçada a todos os destinatários, a transação
 TLS padrão do sistema, as três tentativas com esperas de 5 s e 30 s, a ausência de
 repetição para autenticação recusada, resposta 5xx, servidor sem STARTTLS,
 certificado inválido, todos os destinatários recusados e ausência de mecanismo de
-autenticação, a recusa parcial que não pode ser repetida, a saudação 4xx tratada
-como falha transitória, o tempo esgotado embrulhado em desconexão, a fidelidade do
-dublê às assinaturas do ``smtplib``, a identidade da mensagem entre tentativas e o
-sigilo da senha em toda saída (AAP 0.7.2 e critério 6), inclusive na credencial
-não ASCII, que vira falha permanente de entrega sem ecoar o caractere recusado.
+autenticação, a recusa parcial que não pode ser repetida, a despedida recusada que
+não substitui a causa real da falha, a saudação 4xx tratada como falha transitória,
+o tempo esgotado embrulhado em desconexão, a fidelidade do dublê às assinaturas do
+``smtplib``, a identidade da mensagem entre tentativas e o sigilo da senha em toda
+saída (AAP 0.7.2 e critério 6), inclusive na credencial não ASCII, que vira falha
+permanente de entrega sem ecoar o caractere recusado.
 """
 
 import email
@@ -861,6 +862,191 @@ def test_falha_no_quit_nao_esconde_a_recusa_parcial(
     assert waits == []
     assert caught.value.reason == "parte dos destinatários foi recusada (código 550)"
     assert isinstance(caught.value.__cause__, smtplib.SMTPServerDisconnected)
+
+
+# --- Despedida recusada não substitui a falha em curso -----------------------
+
+# Senha fora do ASCII, fictícia como o par sentinela, usada só para reproduzir o
+# ``UnicodeEncodeError`` que a biblioteca padrão levanta ao montar o AUTH PLAIN.
+NON_ASCII_PASSWORD = "senha-Café-42"
+# Resposta diferente de 221 ao ``QUIT``, a que o ``__exit__`` do ``smtplib``
+# transforma em ``SMTPResponseException`` depois do corpo do ``with``.
+DESPEDIDA_RECUSADA = smtplib.SMTPResponseException(454, b"4.7.0 despedida recusada")
+
+
+def non_ascii_credentials_failure() -> UnicodeEncodeError:
+    """O ``UnicodeEncodeError`` real de uma credencial que o ``AUTH`` não codifica.
+
+    ``auth`` monta ``\\0usuário\\0senha`` e codifica a resposta em ASCII sem tratar a
+    falha, de modo que a exceção carrega o caractere recusado e a posição dele
+    dentro dessa resposta: nada disso pode chegar à linha do operador.
+    """
+    try:
+        ("\0%s\0%s" % (SENDER, NON_ASCII_PASSWORD)).encode("ascii")
+    except UnicodeEncodeError as exc:
+        return exc
+    raise AssertionError("a senha do caso precisa conter caractere fora do ASCII")
+
+
+MASKED_IN_FLIGHT_FAILURES = (
+    pytest.param(
+        "starttls",
+        smtplib.SMTPNotSupportedError("STARTTLS not supported"),
+        "servidor não oferece STARTTLS",
+        1,
+        [],
+        id="starttls-nao-oferecido",
+    ),
+    pytest.param(
+        "login",
+        smtplib.SMTPNotSupportedError("SMTP AUTH extension not supported by server."),
+        "servidor não oferece autenticação AUTH",
+        1,
+        [],
+        id="auth-nao-oferecido",
+    ),
+    pytest.param(
+        "login",
+        non_ascii_credentials_failure(),
+        "as credenciais SMTP precisam conter apenas caracteres ASCII",
+        1,
+        [],
+        id="credencial-nao-ascii",
+    ),
+    pytest.param(
+        "send_message",
+        smtplib.SMTPNotSupportedError("One or more addresses require SMTPUTF8"),
+        "servidor não aceita endereço com caracteres não ASCII (SMTPUTF8)",
+        1,
+        [],
+        id="smtputf8-nao-oferecido",
+    ),
+    pytest.param(
+        "ehlo",
+        smtplib.SMTPHeloError(421, b"4.7.0 servico ocupado"),
+        "saudação recusada (código 421) após 3 tentativas",
+        3,
+        [5, 30],
+        id="saudacao-recusada",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("step", "error", "expected_reason", "expected_instances", "expected_waits"),
+    MASKED_IN_FLIGHT_FAILURES,
+)
+def test_despedida_recusada_nao_esconde_a_falha_em_curso(
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel_username: str,
+    sentinel_password: str,
+    step: str,
+    error: BaseException,
+    expected_reason: str,
+    expected_instances: int,
+    expected_waits: list[float],
+) -> None:
+    """A resposta ao QUIT não substitui a causa que a transação já tinha levantado.
+
+    Cada caso roteiriza a falha do passo e uma despedida com resposta 454 na mesma
+    tentativa, que é o que o ``__exit__`` do ``smtplib`` converte em exceção. Se ela
+    escapasse, o desfecho viria da despedida: as falhas permanentes seriam repetidas
+    três vezes — reenviando a credencial não ASCII ao servidor — e o operador leria
+    ``servidor recusou a mensagem (código 454)`` no lugar do motivo real. A recusa
+    do ``EHLO`` é transitória e por isso se repete, mas o motivo continua sendo a
+    saudação recusada, nunca a despedida.
+    """
+    script = [
+        {step: error, "quit": DESPEDIDA_RECUSADA} for _tentativa in range(expected_instances)
+    ]
+    _fake, instances = install_fake_smtp(monkeypatch, script)
+    waits = patch_sleep(monkeypatch)
+
+    with pytest.raises(mailer.MailError) as caught:
+        mailer.send(
+            build_test_message(), smtp_config(),
+            credentials(sentinel_username, sentinel_password),
+        )
+
+    assert len(instances) == expected_instances
+    assert waits == expected_waits
+    assert caught.value.reason == expected_reason
+    text = str(caught.value)
+    assert "454" not in text
+    assert "454" not in caught.value.reason
+    assert sentinel_username not in text
+    assert sentinel_password not in text
+    assert NON_ASCII_PASSWORD not in text
+    # A despedida foi tentada em toda tentativa: é ela que poderia mascarar a causa.
+    assert all("quit" in instance.events for instance in instances)
+    # E a exceção dela não substitui a causa em nenhum elo da cadeia encadeada.
+    encadeada: BaseException | None = caught.value
+    while encadeada is not None:
+        assert encadeada is not DESPEDIDA_RECUSADA
+        encadeada = encadeada.__cause__
+
+
+def test_despedida_recusada_apos_entrega_aceita_ainda_repete_a_entrega(
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel_username: str,
+    sentinel_password: str,
+) -> None:
+    """Sem falha em curso, a despedida recusada continua sendo falha transitória.
+
+    Aqui a transação inteira foi aceita e só o ``QUIT`` foi respondido com 454: é a
+    janela de duplicidade que a AAP aceita depois do ``DATA``. Guardar a falha em
+    curso não pode engolir este caso — ele precisa continuar virando nova tentativa,
+    com três conexões e esperas de 5 s e 30 s, senão a entrega deixaria de ser
+    repetida quando o pedido manda repeti-la.
+    """
+    _fake, instances = install_fake_smtp(
+        monkeypatch, failure_script("quit", DESPEDIDA_RECUSADA)
+    )
+    waits = patch_sleep(monkeypatch)
+
+    with pytest.raises(mailer.MailError) as caught:
+        mailer.send(
+            build_test_message(), smtp_config(),
+            credentials(sentinel_username, sentinel_password),
+        )
+
+    assert len(instances) == 3
+    assert waits == [5, 30]
+    assert caught.value.reason == (
+        "servidor recusou a mensagem (código 454) após 3 tentativas"
+    )
+    # Cada tentativa teve a mensagem aceita antes da despedida: é a duplicidade que
+    # a AAP aceita nessa janela, e é por isso que ela não pode ser silenciada aqui.
+    assert all(instance.delivered == 1 for instance in instances)
+
+
+def test_defeito_interno_da_transacao_nao_vira_erro_de_smtp(
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel_username: str,
+    sentinel_password: str,
+) -> None:
+    """Defeito interno da transação atravessa o envio intacto, mesmo com QUIT recusado.
+
+    Uma exceção que não é de SMTP nem de rede não pode ser substituída pela resposta
+    ao ``QUIT``: ela continua atravessando :func:`send`, que não captura essa classe,
+    até a captura final do ``cli``, onde vira código de saída 1 em vez de falha de
+    entrega repetida três vezes.
+    """
+    defeito = TypeError("defeito interno da transação")
+    _fake, instances = install_fake_smtp(
+        monkeypatch, [{"send_message": defeito, "quit": DESPEDIDA_RECUSADA}]
+    )
+    waits = patch_sleep(monkeypatch)
+
+    with pytest.raises(TypeError) as caught:
+        mailer.send(
+            build_test_message(), smtp_config(),
+            credentials(sentinel_username, sentinel_password),
+        )
+
+    assert caught.value is defeito
+    assert len(instances) == 1
+    assert waits == []
 
 
 # --- Sigilo das credenciais (AAP 0.7.2 e critério 6) --------------------------

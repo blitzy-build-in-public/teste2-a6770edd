@@ -12,11 +12,13 @@ Os adaptadores entram sob demanda: ``quotes`` e ``report`` dentro de
 
 ``stdout`` recebe todas as linhas de log, o resumo de ``check-config`` e o bloco
 impresso por ``--dry-run``; ``stderr`` recebe apenas as mensagens de uso do
-``argparse`` e uma linha de diagnóstico por falha fatal. Nenhum valor de
-``SMTP_USERNAME`` ou ``SMTP_PASSWORD`` é impresso, registrado ou interpolado em
-mensagem de exceção. Os dois streams são fixados em UTF-8 no início de
-:func:`main`, para que nem o resumo acentuado nem o travessão do assunto dependam
-do locale do host.
+``argparse`` e uma linha de diagnóstico por falha fatal, com uma única exceção
+deliberada: os avisos do módulo ``warnings`` sobre perda de verificação de TLS, que
+o produto não silencia, para que a degradação de segurança continue visível. Nenhum
+valor de ``SMTP_USERNAME`` ou ``SMTP_PASSWORD`` é impresso, registrado ou
+interpolado em mensagem de exceção. Os dois streams são fixados em UTF-8 no início
+de :func:`main`, para que nem o resumo acentuado nem o travessão do assunto
+dependam do locale do host.
 """
 
 import argparse
@@ -119,10 +121,15 @@ def main(argv: list[str] | None = None) -> int:
     É a única raiz de composição: fixa a codificação dos streams, entrega o comando
     a :func:`_dispatch` e descarrega a saída padrão antes do fim do processo. Uma
     falha esperada nunca escapa como exceção — cada desfecho vira um código de
-    saída, com uma linha de diagnóstico em ``stderr`` e um ``ERROR`` no log. Os dois
-    desfechos que o mapa de códigos não classifica por si, a interrupção do operador
-    e o fechamento do pipe por quem lia ``stdout``, entram no código de falha não
-    classificada.
+    saída, com uma linha de diagnóstico em ``stderr`` e um ``ERROR`` no log.
+
+    A captura final de ``Exception`` fica aqui e envolve todo o :func:`_dispatch`,
+    inclusive a montagem do parser, a configuração do log e a leitura dos argumentos:
+    um defeito levantado antes do handler do comando também vira ``1``, com o
+    traceback no ``ERROR`` de ``stdout`` e uma única linha em ``stderr``. Somam-se a
+    ela os dois desfechos que o mapa de códigos não classifica por si, a interrupção do
+    operador e o fechamento do pipe por quem lia ``stdout``, que entram no mesmo código
+    de falha não classificada.
 
     Args:
         argv: argumentos da linha de comando sem o nome do programa. ``None`` usa
@@ -148,6 +155,19 @@ def main(argv: list[str] | None = None) -> int:
             _configure_logging()
         _fatal("Execução interrompida pelo operador.")
         code = EXIT_UNEXPECTED
+    except Exception as exc:
+        # Captura ampla de propósito: este é o classificador final do processo e é o
+        # que converte um defeito inesperado no código de saída 1. Ele fica aqui, e não
+        # dentro de ``_dispatch``, para cobrir também a montagem do parser, a
+        # configuração do log e a leitura dos argumentos. ``SystemExit`` do ``argparse``
+        # não deriva de ``Exception`` e continua atravessando. O traceback é permitido
+        # aqui porque nenhuma mensagem do produto interpola credencial.
+        if _ensure_logging():
+            _LOGGER.exception("falha inesperada durante a execução")
+        # O mesmo escape de :func:`_fatal`: a linha única que o README promete em
+        # ``stderr`` não pode ser dividida por um texto vindo de fora do produto.
+        print(_escape_control_characters(f"falha inesperada: {exc}"), file=sys.stderr)
+        code = EXIT_UNEXPECTED
     if not _flush_stdout() and code == EXIT_OK:
         # A causa não é nomeada aqui de propósito: o descarrego também falha por um
         # erro do sistema de arquivos, e culpar o leitor do pipe mentiria para o cron.
@@ -164,19 +184,23 @@ def _dispatch(argv: list[str] | None) -> int:
 
     Concentra o corpo da execução: monta o parser, configura o log, lê a
     configuração, registra a linha de início e chama o handler do comando, com um
-    classificador por desfecho esperado. Não trata a interrupção do operador nem o
-    fechamento de ``stdout``, que ficam em :func:`main`, e não toca nos streams.
+    classificador por desfecho esperado — ``ConfigError`` vira ``EXIT_CONFIG``. Um
+    defeito que ele não classifica propaga para :func:`main`, onde fica a captura
+    final de ``Exception``. Não trata a interrupção do operador nem o fechamento de
+    ``stdout``, que ficam em :func:`main`, e não toca nos streams.
 
     Args:
         argv: argumentos da linha de comando sem o nome do programa.
 
     Returns:
-        O código de saída do desfecho: ``EXIT_OK``, ``EXIT_UNEXPECTED``,
-        ``EXIT_ALL_QUOTES_FAILED``, ``EXIT_CONFIG`` ou ``EXIT_SMTP``.
+        O código de saída do desfecho: ``EXIT_OK``, ``EXIT_ALL_QUOTES_FAILED``,
+        ``EXIT_CONFIG`` ou ``EXIT_SMTP``.
 
     Raises:
         KeyboardInterrupt: quando o operador interrompe a execução.
         SystemExit: no erro de uso do ``argparse``, com ``EXIT_CONFIG``.
+        Exception: qualquer defeito não classificado, que :func:`main` converte em
+            ``EXIT_UNEXPECTED``.
     """
     parser = _build_parser()
     _configure_logging()
@@ -205,15 +229,6 @@ def _dispatch(argv: list[str] | None) -> int:
     except finmail_config.ConfigError as exc:
         _fatal(str(exc))
         return EXIT_CONFIG
-    except Exception as exc:
-        # Captura ampla de propósito: este é o classificador final do processo e é o
-        # que converte um defeito inesperado no código de saída 1. O traceback é
-        # permitido aqui porque nenhuma mensagem do produto interpola credencial.
-        _LOGGER.exception("falha inesperada durante a execução")
-        # O mesmo escape de :func:`_fatal`: a linha única que o README promete em
-        # ``stderr`` não pode ser dividida por um texto vindo de fora do produto.
-        print(_escape_control_characters(f"falha inesperada: {exc}"), file=sys.stderr)
-        return EXIT_UNEXPECTED
 
 
 def handle_run(config: finmail_config.Config, dry_run: bool) -> int:
@@ -470,11 +485,35 @@ def _configure_logging(timezone: ZoneInfo | None = None) -> None:
     _configure_warnings()
 
 
+def _ensure_logging() -> bool:
+    """Configura o log quando ainda não há handler e diz se ele é utilizável.
+
+    O classificador final de :func:`main` roda também quando o defeito aconteceu antes de
+    :func:`_configure_logging`, e sem handler o ``logging.lastResort`` escreveria o
+    traceback em ``stderr``, dividindo a linha única de diagnóstico. Uma segunda falha
+    aqui — o log não pôde ser configurado, provavelmente pelo mesmo defeito que trouxe a
+    execução até este ponto — não pode escapar: a linha única de ``stderr`` e o código de
+    saída continuam valendo, e repetir a falha esconderia o defeito original.
+
+    Returns:
+        ``True`` quando o logger do produto tem handler e o registro chega a ``stdout``;
+        ``False`` quando o log não pôde ser configurado.
+    """
+    if _LOGGER.handlers:
+        return True
+    try:
+        _configure_logging()
+    except Exception:
+        return False
+    return bool(_LOGGER.handlers)
+
+
 def _configure_warnings() -> None:
     """Mantém o ruído das bibliotecas fora de ``stderr`` sem calar os avisos de segurança.
 
     ``stderr`` carrega a linha única de diagnóstico fatal e as mensagens de uso do
-    ``argparse``, nada mais. Um aviso não passa por logger: ``warnings.showwarning``
+    ``argparse``, e a única exceção são os avisos de segurança que este módulo deixa
+    passar de propósito. Um aviso não passa por logger: ``warnings.showwarning``
     escreve direto em ``stderr``, e a biblioteca de cotações ainda liga o próprio filtro
     de depreciação quando é importada, inserindo-o no início da lista; por isso os
     filtros deste produto são repostos à frente a cada chamada, inclusive depois de a

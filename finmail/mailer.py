@@ -172,6 +172,9 @@ def send(
             falhando depois de ``MAX_ATTEMPTS`` tentativas, com a exceção
             original encadeada como causa, e quando o servidor recusa parte dos
             destinatários, caso em que repetir duplicaria o e-mail já entregue.
+        Exception: um defeito interno da transação, que não é falha de SMTP nem de
+            rede, atravessa intacto: nenhuma classificação o repete, e
+            :func:`finmail.cli.main` o converte no código de saída 1.
     """
     attempt = 1
     while True:
@@ -222,6 +225,11 @@ def _deliver(
 ) -> None:
     """Executa uma transação SMTP completa: TLS primeiro, credencial depois.
 
+    A falha da transação é guardada e levantada depois do encerramento da sessão: a
+    resposta ao ``QUIT`` também pode falhar, e essa falha de despedida não pode
+    substituir a causa real nem transformar uma condição permanente em nova
+    tentativa.
+
     Raises:
         MailError: quando a credencial traz caractere fora do ASCII, que o
             ``login`` não consegue codificar e repetir não resolveria, e quando o
@@ -233,36 +241,49 @@ def _deliver(
     """
     context = ssl.create_default_context()
     refused: dict[str, tuple[int, bytes]] = {}
+    pending: Exception | None = None
     try:
         with smtplib.SMTP(smtp.host, smtp.port, timeout=ATTEMPT_TIMEOUT) as client:
-            _check_ehlo(client)
-            # O RFC 3207 manda descartar o conhecimento obtido antes do TLS, então
-            # o EHLO é reenviado depois do STARTTLS e antes de qualquer credencial.
             try:
-                client.starttls(context=context)
-            except smtplib.SMTPNotSupportedError as exc:
-                raise _UnsupportedAtStage(_STAGE_STARTTLS, str(exc)) from exc
-            _check_ehlo(client)
-            try:
-                client.login(credentials.username, credentials.password)
-            except UnicodeEncodeError as exc:
-                # Credencial fora do ASCII não é falha de transporte: repetir a
-                # transação reenviaria o mesmo valor e falharia igual. O erro sai
-                # como falha permanente de entrega, sem citar a exceção original.
-                raise MailError(smtp.host, smtp.port, _NON_ASCII_CREDENTIALS_REASON) from exc
-            except smtplib.SMTPNotSupportedError as exc:
-                raise _UnsupportedAtStage(_STAGE_LOGIN, str(exc)) from exc
-            try:
-                refused = client.send_message(message)
-            except smtplib.SMTPNotSupportedError as exc:
-                raise _UnsupportedAtStage(_STAGE_SEND_MESSAGE, str(exc)) from exc
+                _check_ehlo(client)
+                # O RFC 3207 manda descartar o conhecimento obtido antes do TLS, então
+                # o EHLO é reenviado depois do STARTTLS e antes de qualquer credencial.
+                try:
+                    client.starttls(context=context)
+                except smtplib.SMTPNotSupportedError as exc:
+                    raise _UnsupportedAtStage(_STAGE_STARTTLS, str(exc)) from exc
+                _check_ehlo(client)
+                try:
+                    client.login(credentials.username, credentials.password)
+                except UnicodeEncodeError as exc:
+                    # Credencial fora do ASCII não é falha de transporte: repetir a
+                    # transação reenviaria o mesmo valor e falharia igual. O erro sai
+                    # como falha permanente de entrega, sem citar a exceção original.
+                    raise MailError(smtp.host, smtp.port, _NON_ASCII_CREDENTIALS_REASON) from exc
+                except smtplib.SMTPNotSupportedError as exc:
+                    raise _UnsupportedAtStage(_STAGE_LOGIN, str(exc)) from exc
+                try:
+                    refused = client.send_message(message)
+                except smtplib.SMTPNotSupportedError as exc:
+                    raise _UnsupportedAtStage(_STAGE_SEND_MESSAGE, str(exc)) from exc
+            except Exception as exc:
+                # A falha da transação fica guardada nesta variável porque a saída do
+                # ``with`` manda QUIT e levanta quando a resposta não é 221: sem isso,
+                # essa falha de despedida substituiria a causa real antes de
+                # :func:`send` classificá-la, e a causa só é levantada depois do bloco.
+                # Vale para qualquer falha, inclusive um defeito interno, que assim
+                # continua chegando ao ``cli`` como tal em vez de virar erro de SMTP.
+                pending = exc
     except (smtplib.SMTPException, OSError) as exc:
         # O encerramento da sessão também levanta: uma resposta diferente de 221 ao
         # QUIT vira exceção. Com parte dos destinatários já recusada, essa falha de
         # despedida não pode esconder a recusa nem fazer a entrega ser repetida.
-        if not refused:
+        if refused:
+            raise _partial_refusal(smtp, refused) from exc
+        if pending is None:
             raise
-        raise _partial_refusal(smtp, refused) from exc
+    if pending is not None:
+        raise pending
     if refused:
         # O ``sendmail`` do smtplib só levanta exceção quando *todos* os
         # destinatários são recusados; com parte deles recusada a mensagem já

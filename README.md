@@ -287,6 +287,8 @@ que `2` signifique exatamente uma coisa: nenhum ativo com dados. `--help` contin
 - **`stdout`**: todas as linhas de log (`INFO`, `WARNING`, `ERROR`) e toda a saída de dados (o resumo de
   `check-config`, o assunto e o corpo texto de `--dry-run`).
 - **`stderr`**: apenas a linha única de diagnóstico de falha fatal e as mensagens de uso do `argparse`.
+  A única exceção deliberada são os avisos do módulo `warnings` sobre perda de verificação de TLS,
+  que o produto não silencia: a degradação de segurança continua visível no `stderr` do operador.
 
 Formato de cada linha de log:
 
