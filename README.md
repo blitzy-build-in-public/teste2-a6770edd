@@ -262,6 +262,8 @@ Ativo | Nome | Moeda | Data | Fechamento | Variação | Variação % | Volume | 
 - **Sinal da variação**: `+` quando positiva, `-` quando negativa, sem sinal quando zero.
 - **Cores no HTML**: verde para variação positiva, vermelho para negativa e cinza para zero ou ausente. A
   cor vem sempre acompanhada do sinal, de modo que a informação não depende só de cor.
+  Uma variação que arredonda para `0,00` / `0,00%` é exibida sem sinal e em cinza, como um zero
+  exato, porque o relatório nunca mostra `+0,00`.
 - **Coluna `Estado`**: `ok` quando o ativo retornou dados; `dados indisponíveis: <motivo>` quando não
   retornou.
 - **Rodapé** em ambos os corpos:

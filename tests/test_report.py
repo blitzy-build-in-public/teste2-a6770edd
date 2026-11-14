@@ -52,6 +52,10 @@ HTML_HEADERS = (
 _ROW_TAG = re.compile(r"<tr[^>]*>")
 _CELL_TAG = re.compile(r"<td[^>]*>")
 _CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
+# Bloco ``<style>`` embutido e as regras de classe com a cor que cada uma declara.
+_STYLE = re.compile(r"<style>(.*?)</style>", re.DOTALL)
+_CSS_RULE = re.compile(r"\.(?P<classe>[\w-]+)\s*\{(?P<declaracoes>[^}]*)\}")
+_CSS_COLOR = re.compile(r"color\s*:\s*(?P<cor>#[0-9a-fA-F]{3,8})")
 
 
 def good(ticker: str = "AAPL", **overrides: object) -> Quote:
@@ -121,6 +125,19 @@ def failing_entries() -> list[Quote | QuoteError]:
     return [quote_aapl(), failure_btc(), quote_petr4()]
 
 
+def variation_entries() -> list[Quote | QuoteError]:
+    """Uma entrada por estado de variação, na ordem: positivo, negativo, os zeros e a falha."""
+    return [
+        good("ALTA.SA", change=3.55, change_pct=1.0),
+        good("BAIXA.SA", change=-0.49, change_pct=-1.1),
+        good("ZERO.SA", change=0.0, change_pct=0.0),
+        good("ARREDONDA_ALTA.SA", change=0.001, change_pct=0.001),
+        good("ARREDONDA_BAIXA.SA", change=-0.001, change_pct=-0.001),
+        good("SEM_VARIACAO.SA", change=None, change_pct=None),
+        failure_btc(),
+    ]
+
+
 def asset_lines(report: Report) -> list[str]:
     """As linhas de ativo do corpo texto: entre o cabeçalho e o rodapé."""
     return report.text.splitlines()[2:-1]
@@ -144,6 +161,23 @@ def row_cells(html: str, index: int) -> list[str]:
 def cell_tags(html: str, index: int) -> list[str]:
     """As tags de abertura ``<td>`` das células da linha ``index``, sem os valores."""
     return _CELL_TAG.findall(html.split("</tr>")[index])
+
+
+def declared_colors(html: str) -> dict[str, str]:
+    """A cor que cada classe declara no ``<style>`` embutido, em minúsculas.
+
+    O bloco é lido como texto e as declarações são procuradas por classe, de modo
+    que a cor verificada é a que o cliente de e-mail realmente aplica — não a
+    presença do nome da classe em algum lugar do documento.
+    """
+    style = _STYLE.search(html)
+    assert style is not None, "o HTML precisa trazer um bloco <style> embutido"
+    colors: dict[str, str] = {}
+    for rule in _CSS_RULE.finditer(style.group(1)):
+        color = _CSS_COLOR.search(rule.group("declaracoes"))
+        if color is not None:
+            colors[rule.group("classe")] = color.group("cor").lower()
+    return colors
 
 
 # --- Assunto (AAP 0.5.4) -------------------------------------------------------
@@ -414,11 +448,98 @@ def test_direcao_positiva_negativa_zero(
     assert fields[6] == variacao_pct
 
 
-@pytest.mark.parametrize("css_class", ["positivo", "negativo", "neutro", "falha"])
-def test_css_define_as_quatro_classes_de_cor(css_class: str) -> None:
-    html = build(failing_entries(), NOW).html
+@pytest.mark.parametrize(
+    ("css_class", "cor"),
+    [
+        ("positivo", "#1a7f37"),
+        ("negativo", "#c62828"),
+        ("neutro", "#666666"),
+        ("falha", "#666666"),
+    ],
+)
+def test_css_declara_verde_vermelho_e_cinza_por_classe(css_class: str, cor: str) -> None:
+    # AAP 0.5.4 "Semântica de variação": verde para positivo, vermelho para negativo,
+    # cinza para zero, ausente e linha com falha. A cor declarada é o que o leitor vê,
+    # então é ela que o teste fixa — não a presença do nome da classe.
+    colors = declared_colors(build(failing_entries(), NOW).html)
 
-    assert f".{css_class}" in html
+    assert colors.get(css_class) == cor
+
+
+def test_as_tres_cores_semanticas_nao_se_colapsam() -> None:
+    # Uma regra única em cinza manteria os nomes ``positivo``/``negativo`` no HTML e
+    # apagaria a direção: as três cores semânticas precisam ser distintas.
+    colors = declared_colors(build(failing_entries(), NOW).html)
+
+    assert len({colors["positivo"], colors["negativo"], colors["neutro"]}) == 3
+
+
+@pytest.mark.parametrize(
+    ("change", "change_pct", "classe", "variacao", "classe_pct", "variacao_pct"),
+    [
+        (0.001, 0.001, "neutro", "0,00", "neutro", "0,00%"),
+        (-0.001, -0.001, "neutro", "0,00", "neutro", "0,00%"),
+        (0.010000000000047748, 0.0027900000000013227, "positivo", "+0,01", "neutro", "0,00%"),
+        (0.89, 0.000072, "positivo", "+0,89", "neutro", "0,00%"),
+    ],
+    ids=["positivo-que-arredonda-para-zero", "negativo-que-arredonda-para-zero",
+         "um-centavo-sobre-358", "oitenta-e-nove-centavos"],
+)
+def test_variacao_que_arredonda_para_zero_fica_sem_sinal_e_neutra(
+    change: float,
+    change_pct: float,
+    classe: str,
+    variacao: str,
+    classe_pct: str,
+    variacao_pct: str,
+) -> None:
+    # AAP 0.8 "Variação positiva, negativa ou zero": nunca mostrar ``+0,00`` e nunca
+    # depender só de cor. Cada célula segue o valor que ela imprime, então a que mostra
+    # ``0,00%`` recebe o mesmo cinza de um zero exato enquanto a outra mantém o sinal.
+    report = build([good(change=change, change_pct=change_pct)], NOW)
+    fields = asset_fields(report)[0]
+    cells = row_cells(report.html, 1)
+    tags = cell_tags(report.html, 1)
+
+    assert tags[5] == f'<td class="num {classe}">'
+    assert cells[5] == variacao
+    assert tags[6] == f'<td class="num {classe_pct}">'
+    assert cells[6] == variacao_pct
+    assert fields[5] == variacao
+    assert fields[6] == variacao_pct
+    # O sinal de mais (ou de menos) sobre zero não aparece em nenhum dos dois corpos.
+    assert "+0,00" not in report.html
+    assert "-0,00" not in report.html
+    assert "+0,00" not in report.text
+    assert "-0,00" not in report.text
+
+
+def test_cor_da_variacao_vem_sempre_acompanhada_do_sinal() -> None:
+    # AAP 0.5.4: "Cores são acompanhadas de sinal, de modo que a informação não depende
+    # só de cor". A varredura cobre positivo, negativo, zero exato, os dois arredondados,
+    # a variação ausente e a linha com falha nas duas colunas de variação.
+    entries = variation_entries()
+    report = build(entries, NOW)
+    classes: set[str] = set()
+    for index in range(1, len(entries) + 1):
+        tags = cell_tags(report.html, index)
+        cells = row_cells(report.html, index)
+        for column in (5, 6):
+            tag, text = tags[column], cells[column]
+            if text.startswith("+"):
+                assert tag == '<td class="num positivo">', (index, column, tag, text)
+            elif text.startswith("-"):
+                assert tag == '<td class="num negativo">', (index, column, tag, text)
+            else:
+                # ``0,00``, ``0,00%`` e ``n/d`` não têm direção: cinza e sem sinal.
+                assert tag == '<td class="num neutro">', (index, column, tag, text)
+            classes.add(tag)
+    # As três cores aparecem de verdade: a varredura não é vácua.
+    assert classes == {
+        '<td class="num positivo">',
+        '<td class="num negativo">',
+        '<td class="num neutro">',
+    }
 
 
 # --- Escape de HTML apenas no HTML (AAP 0.5.4, AAP 0.1.1) --------------------

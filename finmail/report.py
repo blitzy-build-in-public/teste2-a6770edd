@@ -112,19 +112,28 @@ def _row_for_entry(entry: "Quote | QuoteError") -> dict[str, Any]:
 
 
 def _success_row(quote: "Quote") -> dict[str, Any]:
-    """Linha de um ativo cotado, com os valores formatados e ``Estado`` = ``ok``."""
+    """Linha de um ativo cotado, com os valores formatados e ``Estado`` = ``ok``.
+
+    As duas colunas de variação são formatadas de forma independente: cada uma
+    leva o texto e a direção do próprio valor, porque os dois números arredondam
+    em pontos diferentes — um centavo sobre 358,42 é ``+0,01`` ao lado de
+    ``0,00%``.
+    """
+    variacao, direcao = _variacao(quote.change)
+    variacao_pct, direcao_pct = _variacao(quote.change_pct, suffix="%")
     return {
         "ticker": quote.ticker,
         "nome": _format_text(quote.name),
         "moeda": _format_text(quote.currency),
         "data": _format_date(quote.last_trading_date),
         "fechamento": _format_decimal(quote.close),
-        "variacao": _format_signed_decimal(quote.change),
-        "variacao_pct": _format_signed_decimal(quote.change_pct, suffix="%"),
+        "variacao": variacao,
+        "variacao_pct": variacao_pct,
         "volume": _format_integer(quote.volume),
         "min52": _format_decimal(quote.week52_low),
         "max52": _format_decimal(quote.week52_high),
-        "direcao": _direction(quote.change),
+        "direcao": direcao,
+        "direcao_pct": direcao_pct,
         "falha": False,
         "motivo": "",
         "estado": _OK,
@@ -150,21 +159,11 @@ def _failure_row(error: "QuoteError") -> dict[str, Any]:
         "min52": NOT_AVAILABLE,
         "max52": NOT_AVAILABLE,
         "direcao": NEUTRO,
+        "direcao_pct": NEUTRO,
         "falha": True,
         "motivo": reason,
         "estado": f"{_UNAVAILABLE_PREFIX}: {reason}",
     }
-
-
-def _direction(change: float | None) -> str:
-    """Classifica a variação: positiva, negativa ou neutra (zero e ausente)."""
-    if change is None or not math.isfinite(change):
-        return NEUTRO
-    if change > 0:
-        return POSITIVO
-    if change < 0:
-        return NEGATIVO
-    return NEUTRO
 
 
 def _format_text(value: str | None) -> str:
@@ -188,19 +187,24 @@ def _format_decimal(value: float | None) -> str:
     return _to_pt_br(f"{value:,.2f}")
 
 
-def _format_signed_decimal(value: float | None, suffix: str = "") -> str:
-    """Valor com sinal explícito e duas casas (``+3,55``), ou ``n/d``.
+def _variacao(value: float | None, suffix: str = "") -> tuple[str, str]:
+    """Texto com sinal e direção da variação, decididos pelo mesmo valor impresso.
 
-    O sinal só aparece quando o valor é diferente de zero: ``0,00`` e ``0,00%``
-    não levam ``+``, e um valor que arredonda para zero também perde o sinal.
+    Devolver o par ``(texto, direção)`` impede que a cor discorde do texto: a
+    magnitude formatada é a única fonte do sinal, então uma célula pintada de
+    verde ou vermelho sempre traz ``+`` ou ``-``. Um valor que arredonda para
+    ``0,00`` sai sem sinal e ``neutro``, como um zero exato, porque o relatório
+    nunca mostra ``+0,00``; um valor ausente ou não finito sai ``n/d`` e
+    ``neutro``.
     """
     if value is None or not math.isfinite(value):
-        return NOT_AVAILABLE
+        return NOT_AVAILABLE, NEUTRO
     magnitude = _to_pt_br(f"{abs(value):,.2f}")
     if magnitude == _ZERO:
-        return f"{magnitude}{suffix}"
-    sign = "-" if value < 0 else "+"
-    return f"{sign}{magnitude}{suffix}"
+        return f"{magnitude}{suffix}", NEUTRO
+    if value < 0:
+        return f"-{magnitude}{suffix}", NEGATIVO
+    return f"+{magnitude}{suffix}", POSITIVO
 
 
 def _format_integer(value: int | None) -> str:
