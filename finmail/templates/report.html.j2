@@ -13,6 +13,10 @@
     h1 {
       font-size: 18px;
     }
+    .tabela {
+      /* Rolagem horizontal: a tabela não empurra a página além da tela estreita. */
+      overflow-x: auto;
+    }
     table {
       border-collapse: collapse;
       width: 100%;
@@ -22,6 +26,7 @@
     th, td {
       padding: 6px 8px;
       border-bottom: 1px solid #ddd;
+      overflow-wrap: break-word;
     }
     th {
       background: #f4f4f4;
@@ -46,10 +51,20 @@
       color: #666666;
       font-size: 12px;
     }
+    @media (max-width: 860px) {
+      /* Abaixo desta largura a tabela rola dentro da .tabela, sem alargar a página. */
+      table {
+        font-size: 12px;
+      }
+      th, td {
+        padding: 4px 4px;
+      }
+    }
   </style>
 </head>
 <body>
   <h1>{{ subject }}</h1>
+  <div class="tabela">
   <table>
     <thead>
       <tr>
@@ -84,6 +99,7 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
   <p>{{ footer }}</p>
 </body>
 </html>
