@@ -19,8 +19,9 @@ import smtplib
 import ssl
 import time
 from collections.abc import Sequence
+from datetime import datetime
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import format_datetime, make_msgid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -117,6 +118,8 @@ def build_message(
     report: "Report",
     sender: str,
     recipients: Sequence[str],
+    *,
+    now: datetime | None = None,
 ) -> EmailMessage:
     """Monta a única mensagem da execução, endereçada a todos os destinatários.
 
@@ -126,11 +129,22 @@ def build_message(
     viajam em um único cabeçalho ``To``, de modo que a execução nunca produza mais
     de um e-mail.
 
+    O cabeçalho ``Date`` é escrito a partir do instante recebido em ``now``, e não
+    do relógio local do processo: o ``cli`` passa o mesmo instante que já rendeu o
+    assunto, no fuso configurado, de modo que a data do cabeçalho e a data do
+    assunto nunca caiam em dias diferentes. ``email.utils.format_datetime`` emite
+    o deslocamento do próprio ``datetime`` e os nomes de dia e de mês em inglês,
+    o que mantém o cabeçalho no formato do RFC 5322.
+
     Args:
         report: Relatório renderizado, com assunto e os dois corpos.
         sender: Endereço do remetente, já validado pela configuração; o domínio
             dele nomeia o ``Message-ID``.
         recipients: Endereços dos destinatários, já validados pela configuração.
+        now: Instante da execução, já no fuso configurado; é a origem da data do
+            cabeçalho. ``None`` — a forma documentada de três argumentos — mantém
+            o comportamento anterior, com o relógio e o deslocamento locais do
+            processo.
 
     Returns:
         A mensagem pronta para :func:`send`.
@@ -139,7 +153,8 @@ def build_message(
     message["From"] = sender
     message["To"] = ", ".join(recipients)
     message["Subject"] = report.subject
-    message["Date"] = formatdate(localtime=True)
+    stamp = now if now is not None else datetime.now().astimezone()
+    message["Date"] = format_datetime(stamp)
     message["Message-ID"] = make_msgid(domain=_sender_domain(sender))
     # O charset explícito em ambas as partes preserva acentos e o travessão do
     # assunto; set_content + add_alternative é o que produz o multipart esperado.

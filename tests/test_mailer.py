@@ -16,9 +16,10 @@ certificado inválido, todos os destinatários recusados e ausência de mecanism
 autenticação, a recusa parcial que não pode ser repetida, a despedida recusada que
 não substitui a causa real da falha, a saudação 4xx tratada como falha transitória,
 o tempo esgotado embrulhado em desconexão, a fidelidade do dublê às assinaturas do
-``smtplib``, a identidade da mensagem entre tentativas e o sigilo da senha em toda
-saída (AAP 0.7.2 e critério 6), inclusive na credencial não ASCII, que vira falha
-permanente de entrega sem ecoar o caractere recusado.
+``smtplib``, a identidade da mensagem entre tentativas, o fuso do cabeçalho
+``Date``, que vem do instante recebido e não do relógio do processo, e o sigilo
+da senha em toda saída (AAP 0.7.2 e critério 6), inclusive na credencial não
+ASCII, que vira falha permanente de entrega sem ecoar o caractere recusado.
 """
 
 import email
@@ -29,7 +30,9 @@ import logging
 import smtplib
 import ssl
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -355,6 +358,40 @@ def test_build_message_preenche_os_cabecalhos_da_mensagem() -> None:
     assert message_id
     assert "@" in message_id
     assert message.get_all("Bcc") is None
+
+
+# Os dois fusos em jogo em novembro de 2026: -03:00 e +14:00. Um processo tem uma
+# única zona local, então o par prova que o deslocamento do cabeçalho vem do
+# instante recebido e não do relógio do processo.
+DATE_TIMEZONES = (("America/Sao_Paulo", -3), ("Pacific/Kiritimati", 14))
+
+
+@pytest.mark.parametrize(("zone", "offset_hours"), DATE_TIMEZONES)
+def test_build_message_data_do_cabecalho_vem_do_instante_no_fuso_recebido(
+    zone: str,
+    offset_hours: int,
+) -> None:
+    """O ``Date`` segue o fuso de ``now`` e nomeia o mesmo dia do assunto.
+
+    Com ``formatdate(localtime=True)`` a data vinha do relógio e do fuso do
+    processo: um host em UTC+14 com ``timezone: America/Sao_Paulo`` entregava o
+    ``Date`` num dia e o assunto no anterior. Com o instante injetado, o
+    deslocamento do cabeçalho é o do fuso configurado, a data de calendário é a de
+    ``now`` naquele fuso — a mesma do assunto — e o texto do cabeçalho é
+    exatamente o que ``email.utils.format_datetime`` produz.
+    """
+    now = datetime(2026, 11, 13, 23, 30, tzinfo=ZoneInfo(zone))
+    report = build_report()
+
+    message = mailer.build_message(report, SENDER, RECIPIENTS, now=now)
+
+    assert str(message["Date"]) == email.utils.format_datetime(now)
+    sent_at = email.utils.parsedate_to_datetime(str(message["Date"]))
+    assert sent_at.utcoffset() == timedelta(hours=offset_hours)
+    assert sent_at.date() == now.date()
+    # O assunto fixo deste módulo carrega a data 2026-11-13: cabeçalho e assunto
+    # nomeiam o mesmo dia de calendário.
+    assert sent_at.date().isoformat() == report.subject.rsplit(" ", 1)[-1]
 
 
 def test_build_message_endereca_todos_os_destinatarios_em_um_unico_to() -> None:

@@ -289,7 +289,9 @@ def handle_run(config: finmail_config.Config, dry_run: bool) -> int:
         )
         return EXIT_ALL_QUOTES_FAILED
 
-    report = build(entries, now=datetime.now(tz=config.timezone))
+    # Um único instante para o assunto e para o ``Date``: as duas datas não podem divergir.
+    now = datetime.now(tz=config.timezone)
+    report = build(entries, now=now)
 
     if dry_run:
         _LOGGER.info(
@@ -305,7 +307,7 @@ def handle_run(config: finmail_config.Config, dry_run: bool) -> int:
 
     # Uma única mensagem por execução: todos os destinatários no mesmo cabeçalho,
     # montada uma vez e reenviada por mailer.send em caso de nova tentativa.
-    message = mailer.build_message(report, config.sender, config.recipients)
+    message = mailer.build_message(report, config.sender, config.recipients, now=now)
     try:
         # ``credentials`` está preenchida aqui: o ramo de --dry-run retorna antes.
         mailer.send(message, config.smtp, credentials)
@@ -697,27 +699,33 @@ def _abandon_stdout() -> None:
 
 
 class _StdoutHandler(logging.StreamHandler):
-    """Handler de ``stdout`` que não transforma um pipe fechado em traceback.
+    """Handler de ``stdout`` que não transforma uma escrita falha em traceback.
 
     ``stderr`` é reservado à linha única de diagnóstico fatal e às mensagens de uso do
-    ``argparse``, então um leitor que fecha o pipe não pode converter uma linha de log
-    perdida em ``--- Logging error ---`` com traceback. Por isso a escrita é feita
-    aqui, dentro do ``try``: ``BrokenPipeError`` e o ``ValueError`` de um stream já
-    fechado ou descartado são abandonados em silêncio, enquanto todo o resto continua
-    chegando a :meth:`logging.StreamHandler.handleError`, para não esconder um defeito
-    de verdade do formatador. ``RecursionError`` é a exceção que o próprio ``logging``
-    trata como fatal e volta a subir.
+    ``argparse``, então uma linha de log que não pôde ser escrita não pode virar
+    ``--- Logging error ---`` com traceback — nem quando o leitor fecha o pipe, nem quando
+    o destino recusa a escrita. Por isso a escrita é feita aqui, dentro do ``try``: o
+    ``OSError`` — que cobre o ``BrokenPipeError`` do pipe fechado, o ``ENOSPC`` de um
+    sistema de arquivos cheio e qualquer outro erro de escrita — e o ``ValueError`` de um
+    stream já fechado ou descartado são abandonados em silêncio. Perder a linha de log é
+    aceitável porque :func:`_flush_stdout` e :func:`_fatal` relatam a falha uma única vez
+    e a execução termina em ``EXIT_UNEXPECTED``. Todo o resto continua chegando a
+    :meth:`logging.StreamHandler.handleError`, para não esconder um defeito de verdade do
+    formatador. ``RecursionError`` é a exceção que o próprio ``logging`` trata como fatal
+    e volta a subir.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Formata ``record`` e o escreve em ``self.stream``, tolerando o pipe fechado."""
+        """Formata ``record`` e o escreve em ``self.stream``, tolerando a escrita perdida."""
         try:
             message = self.format(record)
             self.stream.write(message + self.terminator)
             self.flush()
-        except (BrokenPipeError, ValueError):
-            # O leitor de stdout fechou o pipe ou o stream já foi fechado: a linha de
-            # log se perde, e é o suficiente — nada de diagnóstico em stderr.
+        except (OSError, ValueError):
+            # O leitor de stdout fechou o pipe, o stream já foi fechado ou o destino
+            # recusou a escrita (``ENOSPC`` em um disco cheio): a linha de log se perde,
+            # e é o suficiente — :func:`_flush_stdout` e :func:`_fatal` relatam a falha
+            # uma única vez em stderr e a execução termina em ``EXIT_UNEXPECTED``.
             pass
         except RecursionError:
             raise

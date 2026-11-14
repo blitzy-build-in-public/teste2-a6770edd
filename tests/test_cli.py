@@ -22,6 +22,7 @@ descritor de arquivo lê com confiança o que ele escreveu.
 """
 
 import logging
+import os
 import re
 import sys
 import tomllib
@@ -1202,9 +1203,10 @@ def test_dry_run_imprime_o_travessao_do_assunto_com_stdout_fora_de_utf8(
     assert subject_line.startswith("Assunto: Resumo de mercado – ")
 
 
-# Interrupção do operador e pipe de ``stdout`` fechado: os dois desfechos que o mapa
-# de códigos não classifica por si entram no código de falha não classificada, e
-# ``stderr`` continua com uma única linha (AAP 0.6.2, disciplina de streams).
+# Interrupção do operador e ``stdout`` que não pode ser escrito — pipe fechado ou
+# destino que recusa a escrita: os desfechos que o mapa de códigos não classifica por
+# si entram no código de falha não classificada, e ``stderr`` continua com uma única
+# linha (AAP 0.6.2, disciplina de streams).
 
 INTERRUPT_PROBE = (
     "import sys\n"
@@ -1224,6 +1226,16 @@ CLOSED_STDOUT_PROBE = (
     "os.close(read_fd)\n"
     "os.dup2(write_fd, 1)\n"
     "os.close(write_fd)\n"
+    "raise SystemExit(finmail.cli.main(['check-config', '--config', sys.argv[1]]))\n"
+)
+
+FULL_DEVICE_STDOUT_PROBE = (
+    "import os\n"
+    "import sys\n"
+    "import finmail.cli\n"
+    "full_fd = os.open('/dev/full', os.O_WRONLY)\n"
+    "os.dup2(full_fd, 1)\n"
+    "os.close(full_fd)\n"
     "raise SystemExit(finmail.cli.main(['check-config', '--config', sys.argv[1]]))\n"
 )
 
@@ -1254,6 +1266,34 @@ def test_pipe_de_stdout_fechado_sai_com_1_sem_ruido_em_stderr(
 
     assert result.returncode == cli.EXIT_UNEXPECTED
     assert len(result.stderr.splitlines()) == 1
+    assert "--- Logging error ---" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "Exception ignored" not in result.stderr
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/dev/full"),
+    reason="o dispositivo /dev/full só existe em Linux, e o produto também roda em macOS",
+)
+def test_stdout_que_recusa_a_escrita_sai_com_1_e_um_diagnostico_unico(
+    run_python: Any,
+    config_writer: Any,
+) -> None:
+    """Com ``stdout`` em ``/dev/full``, a execução termina em ``1`` com uma linha só."""
+    path = config_writer()
+
+    # O redirecionamento do operador deixa ``stdout`` com buffer: a escrita só falha no
+    # descarrego do fim da execução, que é onde ``_flush_stdout`` e ``_fatal`` relatam a
+    # falha. O ``PYTHONUNBUFFERED`` do harness faria a primeira escrita falhar antes e
+    # levaria o erro ao classificador de defeito inesperado.
+    result = run_python(FULL_DEVICE_STDOUT_PROBE, str(path), env={"PYTHONUNBUFFERED": None})
+
+    assert result.returncode == cli.EXIT_UNEXPECTED
+    assert result.stderr.splitlines() == [
+        "Saída padrão interrompida: a escrita em stdout falhou e a saída do "
+        "comando ficou incompleta."
+    ]
+    # A linha de log perdida não pode chegar a ``stderr`` como erro do ``logging``.
     assert "--- Logging error ---" not in result.stderr
     assert "Traceback" not in result.stderr
     assert "Exception ignored" not in result.stderr

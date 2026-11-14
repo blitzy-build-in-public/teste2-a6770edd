@@ -23,8 +23,10 @@ Yahoo Finance e ficam manuais, no ``README.md``.
 import re
 import socket
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from email.header import decode_header, make_header
 from email.message import Message
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +71,14 @@ DRY_RUN_DELIMITER = "--- corpo texto ---"
 # Assunto com travessão EN (U+2013) e a data corrente; a data é o único valor não
 # determinístico, então só o formato é afirmado.
 SUBJECT_PATTERN = re.compile("^Resumo de mercado \u2013 \\d{4}-\\d{2}-\\d{2}$")
+
+# O fuso do cabeçalho ``Date``: o processo roda em UTC+14 e a configuração fixa
+# ``America/Sao_Paulo`` (-03:00), de modo que um ``Date`` tirado do relógio local
+# cairia no dia seguinte ao do assunto. ``DATE_OFFSET`` é o deslocamento que só o
+# fuso configurado explica.
+TZ_DIVERGENTE = "Pacific/Kiritimati"
+TZ_CONFIGURADO = "America/Sao_Paulo"
+DATE_OFFSET = timedelta(hours=-3)
 
 
 @pytest.fixture
@@ -438,3 +448,47 @@ def test_dry_run_nao_abre_conexao_smtp(
     assert "SMTP_PASSWORD" not in proc.stdout, describe(proc)
     assert "SMTP_USERNAME" not in proc.stdout, describe(proc)
     assert proc.stderr == "", describe(proc)
+
+
+# O fuso do cabeçalho ``Date``: a data do cabeçalho sai do instante da execução no
+# fuso de ``timezone`` — o mesmo que rende o assunto —, nunca do relógio local do
+# processo, para que o destinatário não leia dois dias de calendário no mesmo e-mail.
+
+
+def test_data_do_cabecalho_segue_o_fuso_configurado(
+    run_finmail: Callable[..., Any],
+    smtp_server: Any,
+    config_writer: Callable[..., Path],
+    credentials_env: dict[str, str],
+) -> None:
+    """O ``Date`` entregue usa ``timezone`` e nomeia o mesmo dia do assunto.
+
+    O processo roda em ``Pacific/Kiritimati`` (UTC+14) enquanto a configuração fixa
+    ``America/Sao_Paulo`` (-03:00). Um cabeçalho tirado do relógio do processo cairia
+    no dia seguinte ao do assunto; os dois saem do mesmo instante no fuso
+    configurado, então o deslocamento é ``-0300`` e a data é a mesma.
+    """
+    path = smtp_config(
+        config_writer,
+        smtp_server,
+        tickers=list(TICKERS_OK),
+        timezone=TZ_CONFIGURADO,
+    )
+
+    proc = run_finmail(
+        "run",
+        "--config",
+        str(path),
+        env={**credentials_env, "TZ": TZ_DIVERGENTE},
+    )
+
+    assert proc.returncode == 0, describe(proc)
+    assert len(smtp_server.envelopes) == 1, describe(proc)
+    message = smtp_server.envelopes[0].message
+    sent_at = parsedate_to_datetime(str(message["Date"]))
+    assert sent_at.utcoffset() == DATE_OFFSET, message["Date"]
+
+    subject = decoded_header(message, "Subject")
+    assert SUBJECT_PATTERN.match(subject), subject
+    # Mesmo dia de calendário nos dois cabeçalhos: é o que o destinatário lê.
+    assert sent_at.date().isoformat() == subject.rsplit(" ", 1)[-1], (sent_at, subject)
