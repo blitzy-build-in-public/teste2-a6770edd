@@ -24,7 +24,7 @@ descritor de arquivo lê com confiança o que ele escreveu.
 import re
 import tomllib
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
@@ -212,6 +212,26 @@ def two_configs(config_writer: Any, tmp_path: Path) -> tuple[Path, Path]:
     return first, second
 
 
+@pytest.fixture
+def credentials_env(
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel_username: str,
+    sentinel_password: str,
+    config_writer: Any,
+) -> Callable[..., Path]:
+    """Define as duas credenciais do ambiente e devolve o escritor de configuração.
+
+    A credencial é precondição de ``run`` — sem ela o comando sai com ``3`` antes de
+    consultar qualquer ativo —, não o assunto do teste que a usa: só os casos que
+    provam a *ausência* do valor nas saídas precisam declará-la. O escritor é
+    devolvido inteiro, então um teste que precise de outra configuração continua
+    passando os overrides que quiser.
+    """
+    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
+    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
+    return config_writer
+
+
 # Mapa de códigos de saída e superfície de argumentos (AAP 0.6.1, AAP 0.6.2).
 
 
@@ -352,15 +372,13 @@ def test_config_padrao_e_o_config_yaml_do_diretorio_corrente(
 
 def test_run_envia_uma_unica_mensagem_com_um_fetch_por_ativo(
     monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
+    credentials_env: Any,
     sentinel_username: str,
     sentinel_password: str,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Sucesso: uma consulta por ativo, na ordem da configuração, e um único envio."""
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer()
+    path = credentials_env()
     configuration = config_module.load_config(path)
     order = patch_quotes(monkeypatch, good=len(configuration.tickers))
     sent = patch_mailer(monkeypatch)
@@ -389,15 +407,11 @@ def test_run_envia_uma_unica_mensagem_com_um_fetch_por_ativo(
 
 def test_run_parcial_mantem_a_mensagem_e_sai_com_0(
     monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
-    sentinel_username: str,
-    sentinel_password: str,
+    credentials_env: Any,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Um ativo sem dados não impede o envio: a execução continua e sai com ``0``."""
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer(tickers=TICKERS_COM_FALHA)
+    path = credentials_env(tickers=TICKERS_COM_FALHA)
     order = patch_quotes(monkeypatch, good=2, bad=[("BTC-USD", MOTIVO_DA_FALHA)])
     sent = patch_mailer(monkeypatch)
 
@@ -418,15 +432,11 @@ def test_run_parcial_mantem_a_mensagem_e_sai_com_0(
 
 def test_todos_os_ativos_falhando_sai_com_2_sem_montar_mensagem(
     monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
-    sentinel_username: str,
-    sentinel_password: str,
+    credentials_env: Any,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Nenhum ativo com dados: nenhuma mensagem é montada nem enviada, e sai ``2``."""
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer()
+    path = credentials_env()
     configured = config_tickers(path)
     order = patch_quotes(
         monkeypatch,
@@ -561,15 +571,12 @@ def test_nem_dry_run_nem_check_config_chamam_load_credentials(
 
 def test_falha_de_smtp_sai_com_4(
     monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
-    sentinel_username: str,
+    credentials_env: Any,
     sentinel_password: str,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Depois das tentativas de envio, a execução termina em ``4`` e sem senha."""
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer()
+    path = credentials_env()
     patch_quotes(monkeypatch, good=3)
 
     def send(*args: Any, **kwargs: Any) -> None:
@@ -729,9 +736,7 @@ def test_dry_run_mostra_dados_indisponiveis_e_sai_com_0(
 )
 def test_o_assunto_usa_o_fuso_configurado(
     monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
-    sentinel_username: str,
-    sentinel_password: str,
+    credentials_env: Any,
     zone_name: str,
     offset: timedelta,
     capfd: pytest.CaptureFixture[str],
@@ -741,9 +746,7 @@ def test_o_assunto_usa_o_fuso_configurado(
     Os dois fusos diferem em 17 horas, então nenhum relógio local explica os dois
     deslocamentos: o que decide é o campo ``timezone`` da configuração.
     """
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer(timezone=zone_name)
+    path = credentials_env(timezone=zone_name)
     moments = patch_build(monkeypatch)
     patch_quotes(monkeypatch, good=3)
     patch_mailer(monkeypatch)
@@ -773,7 +776,7 @@ def test_check_config_imprime_o_resumo_validado_sem_credenciais(
     config_writer: Any,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """O resumo traz contagens, endereços, SMTP e fuso, e o estado de cada variável."""
+    """O resumo traz contagens, remetente, SMTP, fuso e o estado de cada variável."""
     path = config_writer()
     configuration: Config = config_module.load_config(path)
 
@@ -784,9 +787,9 @@ def test_check_config_imprime_o_resumo_validado_sem_credenciais(
     assert f"tickers: {len(configuration.tickers)}" in out
     assert f"recipients: {len(configuration.recipients)}" in out
     for ticker in configuration.tickers:
-        assert ticker in out
+        assert ticker not in out
     for recipient in configuration.recipients:
-        assert recipient in out
+        assert recipient not in out
     assert configuration.sender in out
     assert f"smtp.host: {configuration.smtp.host}" in out
     assert f"smtp.port: {configuration.smtp.port}" in out
@@ -796,16 +799,13 @@ def test_check_config_imprime_o_resumo_validado_sem_credenciais(
 
 
 def test_check_config_relata_credenciais_definidas_sem_mostrar_os_valores(
-    monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
+    credentials_env: Any,
     sentinel_username: str,
     sentinel_password: str,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Com as variáveis definidas, o resumo diz "definido" e não ecoa os valores."""
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer()
+    path = credentials_env()
 
     assert cli.main(["check-config", "--config", str(path)]) == cli.EXIT_OK
 
@@ -815,6 +815,44 @@ def test_check_config_relata_credenciais_definidas_sem_mostrar_os_valores(
     assert_absent({"stdout": out, "stderr": err}, sentinel_password)
     assert sentinel_username not in out
     assert sentinel_username not in err
+
+
+def test_check_config_e_run_concordam_sobre_credencial_em_branco(
+    monkeypatch: pytest.MonkeyPatch,
+    config_writer: Any,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """A variável só com espaços é "não definido" aqui e recusada pelo ``run``.
+
+    É a costura entre os dois comandos: o resumo não pode anunciar uma credencial
+    que a execução seguinte recusa, e o valor em branco não aparece em saída alguma.
+    """
+    blank = "   "
+    monkeypatch.setenv("SMTP_USERNAME", blank)
+    monkeypatch.setenv("SMTP_PASSWORD", blank)
+    path = config_writer()
+
+    assert cli.main(["check-config", "--config", str(path)]) == cli.EXIT_OK
+    out, err = capture(capfd)
+    assert err == ""
+    presence = [line for line in out.splitlines() if line.startswith("SMTP_")]
+    assert presence == ["SMTP_USERNAME: não definido", "SMTP_PASSWORD: não definido"]
+    assert blank not in out
+
+    assert cli.main(["run", "--config", str(path)]) == cli.EXIT_CONFIG
+    out, err = capture(capfd)
+    assert "SMTP_USERNAME" in err
+    assert "vazia" in err
+    assert blank not in out
+    assert blank not in err
+
+    # A mesma recusa vale para a senha: com o usuário aceitável, o ``run`` cita a
+    # variável em branco que o resumo acima classificou como "não definido".
+    monkeypatch.setenv("SMTP_USERNAME", "usuario-de-teste")
+    assert cli.main(["run", "--config", str(path)]) == cli.EXIT_CONFIG
+    out, err = capture(capfd)
+    assert err == "Credencial ausente: variável SMTP_PASSWORD vazia.\n"
+    assert blank not in out
 
 
 def test_check_config_consulta_apenas_a_presenca_das_credenciais(
@@ -914,15 +952,13 @@ def test_o_localizador_de_segredo_encontra_um_vazamento_de_verdade(
 
 def test_sentinela_de_senha_ausente_de_todas_as_saidas(
     monkeypatch: pytest.MonkeyPatch,
-    config_writer: Any,
+    credentials_env: Any,
     sentinel_username: str,
     sentinel_password: str,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     """As três invocações reais, com a senha definida, não a ecoam em lugar algum."""
-    monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
-    monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
-    path = config_writer()
+    path = credentials_env()
 
     def send(*args: Any, **kwargs: Any) -> None:
         raise mailer_module.MailError(

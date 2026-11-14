@@ -182,7 +182,7 @@ Existem três invocações, e nenhuma outra.
 |---|---|---|---|---|
 | `python -m finmail run` | `config.yaml` e as duas variáveis de credencial | sim, uma requisição por ativo | sim, uma mensagem | linhas de log |
 | `python -m finmail run --dry-run` | apenas `config.yaml` (não lê credencial alguma) | sim, uma requisição por ativo | **não** | linhas de log, o assunto e o corpo texto |
-| `python -m finmail check-config` | apenas `config.yaml`, mais a **presença** das duas variáveis | não | não | o resumo da configuração validada |
+| `python -m finmail check-config` | apenas `config.yaml`, mais a **presença** das duas variáveis | não | não | linhas de log, o resumo da configuração validada |
 
 - **`run`** valida o arquivo inteiro, exige `SMTP_USERNAME` e `SMTP_PASSWORD`, consulta todos os ativos e
   envia uma única mensagem a todos os destinatários. Faltando uma das variáveis, a execução termina com
@@ -190,15 +190,15 @@ Existem três invocações, e nenhuma outra.
 - **`run --dry-run`** valida o arquivo do mesmo modo, **não lê as credenciais** e **não abre conexão
   SMTP**: consulta os ativos, imprime o assunto e o corpo texto em `stdout` e termina. É a forma de conferir
   o relatório sem enviar nada.
-- **`check-config`** valida o arquivo, não abre conexão de nenhum tipo e não exige credencial. Imprime o
-  resumo, incluindo `definido` ou `não definido` para cada variável de credencial:
+- **`check-config`** valida o arquivo, não abre conexão de nenhum tipo e não exige credencial. A saída
+  começa pelas linhas de log e segue com o resumo, que traz `definido` ou `não definido` para cada variável
+  de credencial:
 
   ```text
+  2026-11-13T20:29:55-0300 INFO finmail: Comando 'check-config' com a configuração 'config.yaml' (2 ativos).
   Configuração válida.
   tickers: 2
-  ativos: AAPL, PETR4.SA
   recipients: 2
-  destinatários: usuario1@exemplo.com, usuario2@exemplo.com
   sender: finmail@exemplo.com
   smtp.host: smtp.exemplo.com
   smtp.port: 587

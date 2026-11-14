@@ -244,9 +244,7 @@ def handle_check_config(config: finmail_config.Config) -> int:
     """
     print("Configuração válida.")
     print(f"tickers: {len(config.tickers)}")
-    print(f"ativos: {', '.join(config.tickers)}")
     print(f"recipients: {len(config.recipients)}")
-    print(f"destinatários: {', '.join(config.recipients)}")
     print(f"sender: {config.sender}")
     print(f"smtp.host: {config.smtp.host}")
     print(f"smtp.port: {config.smtp.port}")
@@ -445,8 +443,9 @@ def _count(quantity: int, singular: str, plural: str) -> str:
 def _credential_presence(variable: str) -> str:
     """Diz se a variável de credencial está definida, sem ler o valor.
 
-    Uma variável vazia conta como não definida, do mesmo modo que
-    ``finmail_config.load_credentials`` a trata; apenas a presença é consultada,
+    Definida significa um valor que ``finmail_config.load_credentials`` aceita:
+    uma variável ausente, vazia ou composta apenas de espaços conta como não
+    definida, do mesmo modo que ele a recusa. Apenas a presença é consultada,
     porque ``check-config`` não exige credencial.
 
     Args:
@@ -455,4 +454,4 @@ def _credential_presence(variable: str) -> str:
     Returns:
         ``definido`` ou ``não definido``.
     """
-    return "definido" if os.environ.get(variable) else "não definido"
+    return "definido" if os.environ.get(variable, "").strip() else "não definido"
