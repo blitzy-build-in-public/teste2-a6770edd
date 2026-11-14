@@ -23,6 +23,7 @@ descritor de arquivo lê com confiança o que ele escreveu.
 
 import logging
 import re
+import sys
 import tomllib
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -715,14 +716,61 @@ def estado_de_logging_restaurado() -> Iterator[None]:
     restore_logging_state(state)
 
 
-def test_os_helpers_de_retrato_devolvem_o_estado_do_processo() -> None:
+def entradas_do_produto() -> list[tuple[Any, ...]]:
+    """Devolve as entradas de ``warnings.filters`` cujo namespace é um dos do produto.
+
+    A coleta é pelo padrão de módulo, e não pela posição: o que identifica um filtro do
+    produto é o namespace que ele cala, de modo que o caso não depende da ordem em que
+    ``warnings.filterwarnings`` inseriu as entradas.
+    """
+    return [
+        entrada
+        for entrada in warnings.filters
+        if isinstance(getattr(entrada[3], "pattern", None), str)
+        and entrada[3].pattern in cli._WARNING_MODULES
+    ]
+
+
+def pares_benignos() -> set[tuple[type[Warning], str]]:
+    """Devolve cada par (categoria benigna, namespace) que o produto precisa instalar."""
+    return {
+        (categoria, modulo)
+        for modulo in cli._WARNING_MODULES
+        for categoria in cli._BENIGN_WARNING_CATEGORIES
+    }
+
+
+def aviso_do_urllib3(nome: str) -> type[Warning] | None:
+    """Devolve a classe de aviso de ``urllib3.exceptions`` quando já está carregada.
+
+    O processo da suíte pode ou não ter o ``urllib3`` em ``sys.modules``, e o caso não
+    pode depender disso: a consulta é a mesma que o produto faz, e a prova funcional da
+    classe real fica no subprocesso de ``TLS_WARNING_PROBE``.
+    """
+    modulo = sys.modules.get("urllib3.exceptions")
+    if modulo is None:
+        return None
+    classe = getattr(modulo, nome, None)
+    if isinstance(classe, type) and issubclass(classe, Warning):
+        return classe
+    return None
+
+
+def test_os_helpers_de_retrato_devolvem_o_estado_do_processo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """O retrato desfeito devolve nível, handlers, propagação e filtros de cada logger.
 
     O caso não depende da ordem: ele mesmo tira o retrato, chama a função privada que
     altera o estado global e compara o antes com o depois. A comparação é por identidade
     de handler e de lista, que é o que prova que a restauração escreveu no lugar em vez
-    de trocar os objetos que o resto do processo guarda.
+    de trocar os objetos que o resto do processo guarda. As opções de aviso do
+    interpretador são fixadas porque ``_configure_warnings`` não instala filtro nenhum
+    quando o ambiente pede avisos como erro.
     """
+    # ``sys.warnoptions`` alimenta a decisão de instalar os filtros do produto, então o
+    # caso fixa as opções em vez de herdar as do harness.
+    monkeypatch.setattr(sys, "warnoptions", [])
     alvos = [logging.getLogger(cli.LOGGER_NAME)]
     alvos.extend(logging.getLogger(name) for name in cli.QUIET_LOGGERS)
     alvos.append(logging.getLogger())
@@ -758,9 +806,17 @@ def test_os_helpers_de_retrato_devolvem_o_estado_do_processo() -> None:
         assert logging.getLogger(nome).level == logging.ERROR
         assert logging.getLogger(nome).propagate is False
         assert logging.getLogger(nome).handlers
+    # Os filtros de aviso do produto: uma categoria benigna por namespace, no início da
+    # lista, e nenhuma delas é ``Warning`` inteira.
+    proprios = entradas_do_produto()
+    assert warnings.filters[: len(proprios)] == proprios
+    assert {entrada[3].pattern for entrada in proprios} == set(cli._WARNING_MODULES)
     assert {
-        entrada[3].pattern for entrada in warnings.filters[: len(cli._WARNING_MODULES)]
-    } == set(cli._WARNING_MODULES)
+        (entrada[2], entrada[3].pattern)
+        for entrada in proprios
+        if entrada[2] in cli._BENIGN_WARNING_CATEGORIES
+    } == pares_benignos()
+    assert not any(entrada[2] is Warning for entrada in proprios)
 
     # Duas restaurações seguidas: a segunda reescreve exatamente o mesmo estado.
     restore_logging_state(segundo)
@@ -779,17 +835,19 @@ def test_os_helpers_de_retrato_devolvem_o_estado_do_processo() -> None:
 def test_aviso_de_depreciacao_do_yfinance_nao_chega_ao_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Os filtros do produto cobrem todas as categorias dos namespaces de biblioteca.
+    """O produto cala as categorias benignas dos namespaces de biblioteca, e só elas.
 
     A prova é estrutural, sobre ``warnings.filters``, e não sobre o ``stderr``
     capturado: o pytest envolve cada teste em um contexto de avisos próprio, no qual a
     contagem de avisos depende da ordem e dos plugins — o caminho funcional é provado em
     subprocesso, por
-    ``test_aviso_de_biblioteca_fora_do_namespace_do_yfinance_nao_chega_ao_stderr``. A
-    lista é copiada e o ``monkeypatch`` a restaura, então o teste não deixa estado
-    global nem depende da ordem dos demais.
+    ``test_aviso_de_biblioteca_fora_do_namespace_do_yfinance_nao_chega_ao_stderr`` e por
+    ``test_aviso_de_seguranca_do_urllib3_chega_ao_stderr``. A lista é copiada e o
+    ``monkeypatch`` a restaura, e as opções de aviso do interpretador são fixadas, então
+    o teste não deixa estado global nem depende da ordem dos demais.
     """
     monkeypatch.setattr(warnings, "filters", list(warnings.filters))
+    monkeypatch.setattr(sys, "warnoptions", [])
     # O filtro que a biblioteca de cotações instala ao ser importada, reposto aqui porque
     # o contexto de avisos do pytest descarta o que ela inseriu durante a coleta: ficar à
     # frente dele é o que cala o aviso na execução real.
@@ -798,23 +856,35 @@ def test_aviso_de_depreciacao_do_yfinance_nao_chega_ao_stderr(
     cli._configure_logging()
     cli._configure_logging()
 
-    proprios = [
-        entrada
-        for entrada in warnings.filters
-        if entrada[0] == "ignore"
-        and isinstance(getattr(entrada[3], "pattern", None), str)
-        and entrada[3].pattern in cli._WARNING_MODULES
-    ]
-    # Uma única cópia de cada filtro do produto, ainda que ``_configure_logging`` seja
-    # chamada mais de uma vez.
-    assert len(proprios) == len(cli._WARNING_MODULES)
-    assert {entrada[3].pattern for entrada in proprios} == set(cli._WARNING_MODULES)
-    # Sem categoria o filtro vale para qualquer subclasse de ``Warning``: ``FutureWarning``
-    # e ``RuntimeWarning`` incluídas, não só o aviso de depreciação.
-    assert all(entrada[2] is Warning for entrada in proprios)
+    proprios = entradas_do_produto()
     # Os filtros do produto ocupam o início da lista, imediatamente à frente do filtro da
     # biblioteca de cotações: é essa posição que cala o aviso na execução real.
     assert warnings.filters[: len(proprios)] == proprios
+    # Uma única cópia de cada par (categoria, namespace), ainda que ``_configure_logging``
+    # seja chamada mais de uma vez.
+    assert len({(entrada[2], entrada[3].pattern) for entrada in proprios}) == len(proprios)
+    # Exatamente as categorias benignas em cada namespace: ``FutureWarning``,
+    # ``RuntimeWarning`` e as de depreciação continuam caladas, não só uma delas.
+    assert {
+        (entrada[2], entrada[3].pattern)
+        for entrada in proprios
+        if entrada[2] in cli._BENIGN_WARNING_CATEGORIES
+    } == pares_benignos()
+    # Nenhum filtro do produto é ``Warning`` inteira: sem categoria ele calaria também o
+    # aviso de segurança do ``urllib3``, que precisa continuar chegando a ``stderr``.
+    assert not any(entrada[2] is Warning for entrada in proprios)
+    inseguro = aviso_do_urllib3("InsecureRequestWarning")
+    if inseguro is not None:
+        assert not any(issubclass(inseguro, entrada[2]) for entrada in proprios)
+    # O aviso benigno de biblioteca SSL não suportada tem filtro próprio, instalado só
+    # quando a classe já está no processo; as demais categorias são sempre as benignas.
+    not_openssl = aviso_do_urllib3("NotOpenSSLWarning")
+    categorias = {entrada[2] for entrada in proprios}
+    if not_openssl is None:
+        assert categorias == set(cli._BENIGN_WARNING_CATEGORIES)
+    else:
+        assert categorias == set(cli._BENIGN_WARNING_CATEGORIES) | {not_openssl}
+
     da_biblioteca = [
         posicao
         for posicao, entrada in enumerate(warnings.filters)
@@ -862,6 +932,76 @@ def test_aviso_de_biblioteca_fora_do_namespace_do_yfinance_nao_chega_ao_stderr(
     assert resultado.returncode == 0
     assert resultado.stderr == ""
     assert resultado.stdout.strip() == "PROBE_DONE"
+
+
+# O aviso de segurança do ``urllib3`` na classe real, em subprocesso: o stream reservado à
+# linha única de diagnóstico fatal tem de recebê-lo, e o ruído das bibliotecas de dados
+# tem de continuar calado no mesmo processo.
+TLS_WARNING_PROBE = (
+    "import warnings\n"
+    "import urllib3.exceptions\n"
+    "import finmail.cli as cli\n"
+    "cli._configure_warnings()\n"
+    "warnings.warn_explicit('futuro', FutureWarning, 'x.py', 1, module='pandas.core.frame')\n"
+    "warnings.warn_explicit('runtime', RuntimeWarning, 'y.py', 2, module='numpy.core')\n"
+    "warnings.warn_explicit(\n"
+    "    'FALHA_NA_VERIFICACAO', urllib3.exceptions.InsecureRequestWarning, 'tls.py', 3,\n"
+    "    module='urllib3.connectionpool',\n"
+    ")\n"
+    "print('PROBE_DONE')\n"
+)
+
+
+def test_aviso_de_seguranca_do_urllib3_chega_ao_stderr(run_python: Any) -> None:
+    """A perda de verificação de TLS continua visível com os filtros do produto.
+
+    O filtro por namespace, sem categoria, calava também o ``InsecureRequestWarning`` do
+    ``urllib3``: uma futura perda de verificação de TLS não apareceria em lugar nenhum.
+    Com o conjunto de categorias benignas, o aviso de segurança atravessa os filtros e
+    chega a ``stderr``, enquanto o ``FutureWarning`` de ``pandas`` e o ``RuntimeWarning``
+    de ``numpy`` continuam calados no mesmo processo — a redução não reabriu ``stderr``
+    para o ruído comum. O marcador impresso no fim prova que a sonda chegou até lá.
+    """
+    resultado = run_python(TLS_WARNING_PROBE)
+
+    assert resultado.returncode == 0
+    assert resultado.stdout.strip() == "PROBE_DONE"
+    assert "FALHA_NA_VERIFICACAO" in resultado.stderr
+    assert "InsecureRequestWarning" in resultado.stderr
+    assert "futuro" not in resultado.stderr
+    assert "runtime" not in resultado.stderr
+
+
+# O operador que pede avisos como erro continua sendo obedecido: a escolha dele vem antes
+# do filtro do produto, que só existe para calar ruído de biblioteca em ``stderr``.
+ERROR_WARNINGS_PROBE = (
+    "import warnings\n"
+    "import finmail.cli as cli\n"
+    "cli._configure_warnings()\n"
+    "warnings.warn_explicit(\n"
+    "    'DEPRECIACAO_COMO_ERRO', DeprecationWarning, 'd.py', 1,\n"
+    "    module='pandas.core.frame',\n"
+    ")\n"
+    "print('PROBE_NAO_FALHOU')\n"
+)
+
+
+def test_pythonwarnings_error_vence_os_filtros_do_produto(run_python: Any) -> None:
+    """``PYTHONWARNINGS=error`` é honrado: o aviso de biblioteca derruba o processo.
+
+    Os filtros do produto entram no início de ``warnings.filters``, à frente dos que o
+    interpretador monta a partir de ``-W``/``PYTHONWARNINGS``: sem o recuo de
+    ``_configure_warnings``, o ``DeprecationWarning`` de ``pandas`` seria ignorado e a
+    escolha do operador não teria efeito. O código de saída diferente de zero, com a
+    categoria nomeada em ``stderr``, é o que prova que a exceção do aviso chegou ao fim
+    do processo.
+    """
+    resultado = run_python(ERROR_WARNINGS_PROBE, env={"PYTHONWARNINGS": "error"})
+
+    assert resultado.returncode != 0
+    assert "DEPRECIACAO_COMO_ERRO" in resultado.stderr
+    assert "DeprecationWarning" in resultado.stderr
+    assert "PROBE_NAO_FALHOU" not in resultado.stdout
 
 
 # Um registro de biblioteca em ``ERROR`` também não pode alcançar ``stderr``: o nível

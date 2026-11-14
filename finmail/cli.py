@@ -52,15 +52,29 @@ QUIET_LOGGERS = ("yfinance", "peewee", "urllib3", "curl_cffi")
 
 # ``warnings.showwarning`` escreve direto em ``stderr``, o stream reservado à linha única
 # de diagnóstico fatal e às mensagens de uso; por isso os avisos das bibliotecas ficam
-# ignorados, em qualquer categoria. A lista cobre os namespaces de :data:`QUIET_LOGGERS`
-# e as bibliotecas que entram junto com a de cotações, e cada padrão é ancorado em
-# ``(?:\.|$)`` para que um módulo de nome parecido não case por prefixo.
+# ignorados. A lista cobre os namespaces de :data:`QUIET_LOGGERS` e as bibliotecas que
+# entram junto com a de cotações, e cada padrão é ancorado em ``(?:\.|$)`` para que um
+# módulo de nome parecido não case por prefixo.
 _THIRD_PARTY_WARNING_MODULES = r"^(?:yfinance|peewee|urllib3|curl_cffi|pandas|numpy)(?:\.|$)"
 # O produto nunca chama ``warnings.warn``: um aviso atribuído a ``finmail.*`` é um aviso
 # de biblioteca que ``stacklevel`` deslocou para fora dela, e quebraria o mesmo contrato.
 _PRODUCT_WARNING_MODULES = r"^finmail(?:\.|$)"
-# Os filtros do produto, na ordem em que são instalados em ``warnings.filters``.
+# Os namespaces cujo ruído o produto cala, na ordem em que os filtros são instalados.
 _WARNING_MODULES = (_THIRD_PARTY_WARNING_MODULES, _PRODUCT_WARNING_MODULES)
+# As categorias que carregam o ruído das bibliotecas e podem chegar a ``stderr`` são as
+# de depreciação, de futuro, de uso e de tempo de execução — não ``Warning`` inteira. A
+# família ``SecurityWarning``/``HTTPWarning`` do ``urllib3`` fica de fora dela:
+# ``InsecureRequestWarning``, ``NotOpenSSLWarning`` e ``SystemTimeWarning`` derivam de
+# ``SecurityWarning`` < ``HTTPWarning`` < ``Warning`` e nenhuma deriva de ``UserWarning``,
+# de modo que a perda de verificação de TLS continua visível. O aviso benigno de
+# biblioteca SSL não suportada recebe um filtro explícito, mais abaixo.
+_BENIGN_WARNING_CATEGORIES = (
+    DeprecationWarning,
+    PendingDeprecationWarning,
+    FutureWarning,
+    UserWarning,
+    RuntimeWarning,
+)
 
 # Caracteres de controle de C0, DEL e C1: um deles dividiria a linha do evento em duas
 # linhas físicas ou mudaria o estado do terminal do operador, então o formato do log os
@@ -457,7 +471,7 @@ def _configure_logging(timezone: ZoneInfo | None = None) -> None:
 
 
 def _configure_warnings() -> None:
-    """Mantém os avisos das bibliotecas fora de ``stderr``, em qualquer categoria.
+    """Mantém o ruído das bibliotecas fora de ``stderr`` sem calar os avisos de segurança.
 
     ``stderr`` carrega a linha única de diagnóstico fatal e as mensagens de uso do
     ``argparse``, nada mais. Um aviso não passa por logger: ``warnings.showwarning``
@@ -466,20 +480,102 @@ def _configure_warnings() -> None:
     filtros deste produto são repostos à frente a cada chamada, inclusive depois de a
     biblioteca entrar no processo.
 
+    O que fica ignorado é cada categoria de :data:`_BENIGN_WARNING_CATEGORIES` em cada
+    padrão de :data:`_WARNING_MODULES`, e não ``Warning`` inteira: a família de avisos de
+    segurança do ``urllib3``, com ``InsecureRequestWarning`` incluído, continua chegando
+    a ``stderr``, para que uma futura perda de verificação de TLS apareça. O aviso
+    benigno de biblioteca SSL não suportada ganha um filtro explícito, porque a categoria
+    dele fica fora desse conjunto.
+
     O namespace ``finmail`` entra na lista porque o produto não emite aviso algum: um
     aviso atribuído a um módulo do produto só pode ser um aviso de biblioteca que
     ``stacklevel`` deslocou para fora dela, e ele quebraria o contrato do mesmo modo.
 
+    Se o operador pediu avisos como erro em ``-W``/``PYTHONWARNINGS``, nada é instalado:
+    os filtros do produto entram no início de ``warnings.filters``, à frente dos que o
+    interpretador montou a partir dessas opções, e calar o namespace de uma biblioteca
+    sobreporia a escolha dele.
+
     Idempotente: cada chamada deixa uma única cópia de cada filtro do produto, mesmo com
     as duas chamadas de :func:`_configure_logging` de uma execução.
     """
-    for module in _WARNING_MODULES:
-        warnings.filterwarnings("ignore", module=module)
-    filters = warnings.filters
-    own = filters[: len(_WARNING_MODULES)]
-    # As inserções acima repetem as entradas a cada chamada; manter só o primeiro par
-    # impede que a lista cresça a cada execução dentro do mesmo processo.
-    filters[len(own):] = [entry for entry in filters[len(own):] if entry not in own]
+    if _warnings_are_errors():
+        return
+    product_filters = [
+        (category, module)
+        for module in _WARNING_MODULES
+        for category in _BENIGN_WARNING_CATEGORIES
+    ]
+    not_openssl = _not_openssl_warning()
+    if not_openssl is not None:
+        product_filters.append((not_openssl, _THIRD_PARTY_WARNING_MODULES))
+    for category, module in product_filters:
+        warnings.filterwarnings("ignore", category=category, module=module)
+    installed = warnings.filters
+    own = {
+        _warning_filter_identity(entry) for entry in installed[: len(product_filters)]
+    }
+    # As inserções acima repetem as entradas a cada chamada; manter só a primeira cópia
+    # de cada filtro impede que a lista cresça a cada execução dentro do mesmo processo.
+    installed[len(product_filters):] = [
+        entry
+        for entry in installed[len(product_filters):]
+        if _warning_filter_identity(entry) not in own
+    ]
+
+
+def _warnings_are_errors() -> bool:
+    """Diz se o operador pediu avisos como erro em ``-W`` ou em ``PYTHONWARNINGS``.
+
+    ``sys.warnoptions`` guarda cada entrada dessas opções como o operador a escreveu, e a
+    ação é o texto que antecede o primeiro ``:`` — ``error`` em ``-W error`` e em
+    ``error::DeprecationWarning``. É essa lista que revela o pedido dele antes de
+    qualquer filtro ter sido instalado.
+
+    Returns:
+        ``True`` quando alguma entrada pede a ação ``error``.
+    """
+    return any(option.split(":", 1)[0].strip() == "error" for option in sys.warnoptions)
+
+
+def _not_openssl_warning() -> type[Warning] | None:
+    """Devolve ``urllib3.exceptions.NotOpenSSLWarning``, se a classe já estiver carregada.
+
+    O aviso de biblioteca SSL não suportada é benigno e chegaria a ``stderr`` em um host
+    cujo CPython foi compilado contra LibreSSL, mas a categoria dele fica fora de
+    :data:`_BENIGN_WARNING_CATEGORIES`. A classe é procurada apenas em ``sys.modules``:
+    ``urllib3`` é dependência transitiva que o produto não importa, e ``check-config``
+    só pode carregar a biblioteca padrão e :mod:`finmail.config`.
+
+    Returns:
+        A classe de aviso quando ``urllib3.exceptions`` está em ``sys.modules`` e expõe o
+        nome, e ``None`` quando a biblioteca não entrou no processo.
+    """
+    module = sys.modules.get("urllib3.exceptions")
+    if module is None:
+        return None
+    candidate = getattr(module, "NotOpenSSLWarning", None)
+    if isinstance(candidate, type) and issubclass(candidate, Warning):
+        return candidate
+    return None
+
+
+def _warning_filter_identity(entry: tuple[object, ...]) -> tuple[object, ...]:
+    """Reduz uma entrada de ``warnings.filters`` a uma forma comparável entre chamadas.
+
+    ``warnings.filterwarnings`` guarda o módulo como expressão regular compilada, e duas
+    compilações do mesmo padrão são objetos distintos; comparar as entradas como estão
+    deixaria passar a cópia repetida de um filtro do produto. O padrão em texto, quando
+    existe, é o que dá identidade estável à entrada.
+
+    Args:
+        entry: entrada ``(ação, mensagem, categoria, módulo, linha)`` de ``warnings.filters``.
+
+    Returns:
+        A mesma entrada com o módulo reduzido ao texto do padrão.
+    """
+    action, message, category, module, lineno = entry
+    return (action, message, category, getattr(module, "pattern", module), lineno)
 
 
 def _stdout_handler(logger: logging.Logger) -> logging.StreamHandler:
@@ -511,6 +607,7 @@ def _escape_control_characters(value: str) -> str:
         ``\\xNN``.
     """
     return _CONTROL_CHARS.sub(lambda match: f"\\x{ord(match.group()):02x}", value)
+
 
 def _flush_stdout() -> bool:
     """Descarrega ``stdout`` e diz se a saída do comando chegou inteira ao destino.
