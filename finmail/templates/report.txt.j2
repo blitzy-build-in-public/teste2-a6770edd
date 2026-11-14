@@ -1,4 +1,4 @@
 {{ subject }}
 Ativo | Nome | Moeda | Data | Fechamento | Variação | Variação % | Volume | Mín. 52s | Máx. 52s | Estado
 {% for row in rows %}{{ row.ticker }} | {{ row.nome }} | {{ row.moeda }} | {{ row.data }} | {{ row.fechamento }} | {{ row.variacao }} | {{ row.variacao_pct }} | {{ row.volume }} | {{ row.min52 }} | {{ row.max52 }} | {% if row.falha %}{{ estado_falha }}: {{ row.motivo }}{% else %}{{ estado_ok }}{% endif %}
-{% endfor %}{{ footer }}{{ "\n" }}{# The final newline is emitted explicitly: Jinja strips the template source's own last newline, so {{ footer }} alone would end the body without one. #}
+{% endfor %}{{ footer }}{{ "\n" }}{# A quebra final é emitida explicitamente: o Jinja remove a última quebra do próprio modelo, então ``footer`` sozinho encerraria o corpo sem ela. #}
