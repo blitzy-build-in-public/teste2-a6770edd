@@ -21,10 +21,11 @@ o ``cli`` instala o próprio handler de log em ``sys.stdout`` e só a captura po
 descritor de arquivo lê com confiança o que ele escreveu.
 """
 
+import logging
 import re
 import tomllib
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
@@ -607,12 +608,13 @@ def test_defeito_inesperado_sai_com_1_e_um_diagnostico_unico_em_stderr(
 
     O traceback pertence ao registro ``ERROR`` do log em ``stdout`` (AAP 0.6.2:
     ``stdout`` recebe todas as linhas de log), então o que se exige de ``stderr``
-    é exatamente uma linha, sem traceback.
+    é exatamente uma linha, sem traceback. A mensagem da exceção carrega uma quebra
+    de linha de propósito: nem um texto de fora do produto divide a linha única.
     """
     path = config_writer()
 
     def explode(ticker: str) -> Quote:
-        raise RuntimeError("falha inesperada")
+        raise RuntimeError("falha inesperada\ncom quebra de linha")
 
     monkeypatch.setattr(quotes_module, "fetch", explode)
     patch_mailer(monkeypatch)
@@ -622,27 +624,176 @@ def test_defeito_inesperado_sai_com_1_e_um_diagnostico_unico_em_stderr(
     out, err = capture(capfd)
     assert len(err.splitlines()) == 1
     assert "falha inesperada" in err
+    assert "com quebra de linha" in err
+    assert "\\x0a" in err
     assert "Traceback" not in err
     assert lines_with_level(out, "ERROR")
 
 
-# Disciplina de streams: a biblioteca de cotações liga os próprios avisos de depreciação
-# ao ser importada, e ``stderr`` é reservado à linha única de diagnóstico fatal e às
-# mensagens de uso (AAP 0.6.2, README).
+# ``cli._configure_logging`` mexe em estado global do processo — o handler do logger do
+# produto (apontado para o ``sys.stdout`` daquele instante), o nível e a propagação dele,
+# os loggers de ``cli.QUIET_LOGGERS``, um handler nulo na raiz e a lista de filtros de
+# aviso — e não desfaz nada. A fixture autouse abaixo devolve esse estado ao fim de cada
+# teste do módulo: sem ela o teste seguinte herda um handler apontado para um stream de
+# captura já encerrado, e ``logging.handleError`` engole o erro de escrita.
+
+
+@dataclass(frozen=True)
+class LoggerState:
+    """Estado de um logger: nível, handlers, propagação e desativação."""
+
+    logger: logging.Logger
+    level: int
+    handlers: list[logging.Handler]
+    propagate: bool
+    disabled: bool
+
+
+@dataclass(frozen=True)
+class LoggingState:
+    """Retrato do estado global que ``cli._configure_logging`` altera."""
+
+    loggers: tuple[LoggerState, ...]
+    warning_filters: list[Any]
+
+
+def snapshot_logging_state() -> LoggingState:
+    """Guarda o estado de logging e de filtros de aviso que o produto altera.
+
+    Os alvos são o logger do produto, os loggers de ``cli.QUIET_LOGGERS`` — iterados a
+    partir da constante do produto, para que o retrato acompanhe a lista se ela mudar — e
+    o logger raiz, mais a lista de ``warnings.filters``. A lista de handlers é copiada, de
+    modo que o retrato não acompanhe alterações posteriores no logger.
+    """
+    loggers = [logging.getLogger(cli.LOGGER_NAME)]
+    loggers.extend(logging.getLogger(name) for name in cli.QUIET_LOGGERS)
+    loggers.append(logging.getLogger())
+    return LoggingState(
+        loggers=tuple(
+            LoggerState(
+                logger=logger,
+                level=logger.level,
+                handlers=list(logger.handlers),
+                propagate=logger.propagate,
+                disabled=logger.disabled,
+            )
+            for logger in loggers
+        ),
+        warning_filters=list(warnings.filters),
+    )
+
+
+def restore_logging_state(state: LoggingState) -> None:
+    """Devolve ao processo exatamente o estado guardado por ``state``.
+
+    A lista de handlers e a de filtros de aviso são reescritas no lugar, e não trocadas:
+    os objetos de handler que outras partes do processo guardam continuam válidos,
+    inclusive os do plugin de logging do pytest, de modo que ``caplog`` e a captura da
+    suíte seguem intactos. Restaurar duas vezes com o mesmo retrato reescreve o mesmo
+    estado, então a função é segura para os testes que chamam ``_configure_logging`` mais
+    de uma vez.
+    """
+    for saved in state.loggers:
+        saved.logger.setLevel(saved.level)
+        saved.logger.handlers[:] = saved.handlers
+        saved.logger.propagate = saved.propagate
+        saved.logger.disabled = saved.disabled
+    warnings.filters[:] = state.warning_filters
+
+
+@pytest.fixture(autouse=True)
+def estado_de_logging_restaurado() -> Iterator[None]:
+    """Devolve o estado global de logging ao fim de cada teste deste módulo.
+
+    É autouse porque qualquer teste do módulo chega a ``cli._configure_logging``, seja
+    por ``cli.main``, seja por chamada direta: o retrato é tirado antes do teste e
+    devolvido no teardown, e nenhum módulo herda handler, nível, propagação ou filtro
+    deixado por outro.
+    """
+    state = snapshot_logging_state()
+    yield
+    restore_logging_state(state)
+
+
+def test_os_helpers_de_retrato_devolvem_o_estado_do_processo() -> None:
+    """O retrato desfeito devolve nível, handlers, propagação e filtros de cada logger.
+
+    O caso não depende da ordem: ele mesmo tira o retrato, chama a função privada que
+    altera o estado global e compara o antes com o depois. A comparação é por identidade
+    de handler e de lista, que é o que prova que a restauração escreveu no lugar em vez
+    de trocar os objetos que o resto do processo guarda.
+    """
+    alvos = [logging.getLogger(cli.LOGGER_NAME)]
+    alvos.extend(logging.getLogger(name) for name in cli.QUIET_LOGGERS)
+    alvos.append(logging.getLogger())
+
+    def retratos() -> dict[str, tuple[int, list[int], bool, bool]]:
+        return {
+            logger.name: (
+                logger.level,
+                [id(handler) for handler in logger.handlers],
+                logger.propagate,
+                logger.disabled,
+            )
+            for logger in alvos
+        }
+
+    listas = {logger.name: id(logger.handlers) for logger in alvos}
+    filtros = list(warnings.filters)
+    antes = retratos()
+
+    primeiro = snapshot_logging_state()
+    segundo = snapshot_logging_state()
+    cli._configure_logging()
+    cli._configure_logging()
+
+    # A função privada mexeu no estado global de cada logger: sem esta metade do caso,
+    # uma restauração vazia passaria como se tivesse devolvido alguma coisa.
+    depois = retratos()
+    for nome in (cli.LOGGER_NAME, *cli.QUIET_LOGGERS):
+        assert depois[nome] != antes[nome]
+    assert logging.getLogger(cli.LOGGER_NAME).level == logging.INFO
+    assert logging.getLogger(cli.LOGGER_NAME).propagate is False
+    for nome in cli.QUIET_LOGGERS:
+        assert logging.getLogger(nome).level == logging.ERROR
+        assert logging.getLogger(nome).propagate is False
+        assert logging.getLogger(nome).handlers
+    assert {
+        entrada[3].pattern for entrada in warnings.filters[: len(cli._WARNING_MODULES)]
+    } == set(cli._WARNING_MODULES)
+
+    # Duas restaurações seguidas: a segunda reescreve exatamente o mesmo estado.
+    restore_logging_state(segundo)
+    restore_logging_state(primeiro)
+
+    assert retratos() == antes
+    assert {logger.name: id(logger.handlers) for logger in alvos} == listas
+    assert warnings.filters == filtros
+
+
+# Disciplina de streams: um aviso de biblioteca não passa por logger —
+# ``warnings.showwarning`` escreve direto em ``stderr``, que é reservado à linha única de
+# diagnóstico fatal e às mensagens de uso (AAP 0.6.2, README).
 
 
 def test_aviso_de_depreciacao_do_yfinance_nao_chega_ao_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """O filtro de avisos do produto cobre o ``yfinance`` e nada além dele.
+    """Os filtros do produto cobrem todas as categorias dos namespaces de biblioteca.
 
     A prova é estrutural, sobre ``warnings.filters``, e não sobre o ``stderr``
     capturado: o pytest envolve cada teste em um contexto de avisos próprio, no qual a
-    contagem de avisos depende da ordem e dos plugins. A lista é copiada e o
-    ``monkeypatch`` a restaura, então o teste não deixa estado global nem depende da
-    ordem dos demais.
+    contagem de avisos depende da ordem e dos plugins — o caminho funcional é provado em
+    subprocesso, por
+    ``test_aviso_de_biblioteca_fora_do_namespace_do_yfinance_nao_chega_ao_stderr``. A
+    lista é copiada e o ``monkeypatch`` a restaura, então o teste não deixa estado
+    global nem depende da ordem dos demais.
     """
     monkeypatch.setattr(warnings, "filters", list(warnings.filters))
+    # O filtro que a biblioteca de cotações instala ao ser importada, reposto aqui porque
+    # o contexto de avisos do pytest descarta o que ela inseriu durante a coleta: ficar à
+    # frente dele é o que cala o aviso na execução real.
+    warnings.filterwarnings("default", category=DeprecationWarning, module="^yfinance")
 
     cli._configure_logging()
     cli._configure_logging()
@@ -651,17 +802,153 @@ def test_aviso_de_depreciacao_do_yfinance_nao_chega_ao_stderr(
         entrada
         for entrada in warnings.filters
         if entrada[0] == "ignore"
-        and entrada[2] is DeprecationWarning
-        and isinstance(entrada[3], re.Pattern)
-        and entrada[3].match("yfinance.utils")
+        and isinstance(getattr(entrada[3], "pattern", None), str)
+        and entrada[3].pattern in cli._WARNING_MODULES
     ]
-    # Uma única cópia, ainda que ``_configure_logging`` seja chamada mais de uma vez.
-    assert len(proprios) == 1
-    padrao = proprios[0][3]
-    assert not padrao.match("finmail.quotes")
-    # O filtro da biblioteca já está na lista — os testes importam o ``yfinance`` junto
-    # com ``finmail.quotes`` —, e ficar à frente dele é o que cala o aviso.
-    assert warnings.filters[0] == proprios[0]
+    # Uma única cópia de cada filtro do produto, ainda que ``_configure_logging`` seja
+    # chamada mais de uma vez.
+    assert len(proprios) == len(cli._WARNING_MODULES)
+    assert {entrada[3].pattern for entrada in proprios} == set(cli._WARNING_MODULES)
+    # Sem categoria o filtro vale para qualquer subclasse de ``Warning``: ``FutureWarning``
+    # e ``RuntimeWarning`` incluídas, não só o aviso de depreciação.
+    assert all(entrada[2] is Warning for entrada in proprios)
+    # Os filtros do produto ocupam o início da lista, imediatamente à frente do filtro da
+    # biblioteca de cotações: é essa posição que cala o aviso na execução real.
+    assert warnings.filters[: len(proprios)] == proprios
+    da_biblioteca = [
+        posicao
+        for posicao, entrada in enumerate(warnings.filters)
+        if entrada[0] == "default" and getattr(entrada[3], "pattern", "") == "^yfinance"
+    ]
+    assert da_biblioteca and da_biblioteca[0] == len(proprios)
+
+    padroes = {entrada[3].pattern: entrada[3] for entrada in proprios}
+    das_bibliotecas = padroes[cli._THIRD_PARTY_WARNING_MODULES]
+    do_produto = padroes[cli._PRODUCT_WARNING_MODULES]
+    for nome in ("yfinance.utils", "pandas.core.frame", "numpy.core", "curl_cffi.requests"):
+        assert das_bibliotecas.match(nome)
+    assert do_produto.match("finmail.quotes")
+    # Um namespace apenas parecido não casa: a âncora impede o prefixo solto.
+    assert not das_bibliotecas.match("yfinance_extra")
+    assert not do_produto.match("finmailx")
+
+
+# O caminho funcional do aviso, em subprocesso: ``warnings.showwarning`` escreve no
+# ``stderr`` do processo e os filtros do pytest interferem na contagem.
+WARNINGS_PROBE = (
+    "import warnings\n"
+    "import finmail.cli as cli\n"
+    "cli._configure_warnings()\n"
+    "warnings.warn_explicit('futuro', FutureWarning, 'x.py', 1, module='pandas.core.frame')\n"
+    "warnings.warn_explicit('runtime', RuntimeWarning, 'y.py', 2, module='numpy.core')\n"
+    "warnings.warn_explicit('atribuido', FutureWarning, 'z.py', 3, module='finmail.quotes')\n"
+    "print('PROBE_DONE')\n"
+)
+
+
+def test_aviso_de_biblioteca_fora_do_namespace_do_yfinance_nao_chega_ao_stderr(
+    run_python: Any,
+) -> None:
+    """Nenhuma categoria de aviso de biblioteca chega a ``stderr`` (AAP 0.6.2).
+
+    Um ``FutureWarning`` de ``pandas``, um ``RuntimeWarning`` de ``numpy`` e um aviso que
+    ``stacklevel`` atribuiu a ``finmail.quotes`` não podem escrever em ``stderr``, o
+    stream reservado à linha única de diagnóstico fatal e às mensagens de uso. O marcador
+    impresso no fim prova que a sonda chegou até lá: sem ele, um erro de importação
+    deixaria ``stderr`` vazio e o teste passaria sem provar nada.
+    """
+    resultado = run_python(WARNINGS_PROBE)
+
+    assert resultado.returncode == 0
+    assert resultado.stderr == ""
+    assert resultado.stdout.strip() == "PROBE_DONE"
+
+
+# Um registro de biblioteca em ``ERROR`` também não pode alcançar ``stderr``: o nível
+# sozinho não impede ``logging.lastResort`` de escrever ali (AAP 0.6.2).
+
+
+def test_registro_de_logger_de_terceiro_nao_chega_ao_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """``ERROR`` de logger de biblioteca não aparece em ``stderr`` nem em ``stdout``.
+
+    A raiz é esvaziada antes da chamada para que o caso exercitado seja o de um
+    processo real, sem handler nenhum na cadeia: é nele que ``logging.lastResort``
+    escreveria o registro em ``stderr``, o stream reservado à linha única de
+    diagnóstico fatal e às mensagens de uso (AAP 0.6.2). O ``monkeypatch`` devolve os
+    handlers da raiz no teardown, e ``propagate = False`` mais o destino nulo de cada
+    logger de ``QUIET_LOGGERS`` fecham o caminho independentemente da raiz.
+    """
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", list(root.handlers))
+    root.handlers = []
+
+    # Duas chamadas, como em cada execução: nada pode se acumular na segunda.
+    cli._configure_logging()
+    cli._configure_logging()
+
+    logging.getLogger("yfinance").error("HTTP Error 404: quoteSummary")
+    logging.getLogger("bs4").warning("ruído de parsing")
+
+    out, err = capture(capfd)
+    assert out == ""
+    assert err == ""
+
+    for name in cli.QUIET_LOGGERS:
+        quiet = logging.getLogger(name)
+        assert quiet.level == logging.ERROR
+        assert quiet.propagate is False
+        nulos = [
+            handler for handler in quiet.handlers if isinstance(handler, logging.NullHandler)
+        ]
+        assert len(nulos) == 1
+    # Um logger fora de ``QUIET_LOGGERS`` propaga até a raiz; o destino nulo dela é o
+    # que impede o ``lastResort`` de escrever em ``stderr``.
+    nulos_na_raiz = [
+        handler for handler in root.handlers if isinstance(handler, logging.NullHandler)
+    ]
+    assert len(nulos_na_raiz) == 1
+
+
+# Um valor hostil interpolado em um registro não pode dividir o evento em duas linhas nem
+# levar um escape ANSI ao terminal do operador (AAP 0.6.2: uma linha por evento).
+
+
+def test_valor_hostil_mantem_uma_linha_por_evento_de_log(
+    monkeypatch: pytest.MonkeyPatch,
+    config_writer: Any,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Ticker com ``\\n`` e com escape ANSI sai escapado, um evento por linha física.
+
+    O ``\\n`` é o que dividiria o ``WARNING`` do ativo em duas linhas, deixando a segunda
+    sem data, nível e logger; o escape ANSI é o que mudaria o estado do terminal. A região
+    verificada é a que antecede o bloco de ``--dry-run``: o corpo do e-mail é saída de
+    dados, impressa como o relatório a montou.
+    """
+    com_quebra = "AA\nPL"
+    com_escape = "\x1b[31mFAKE\x1b[0m"
+    falhas = [(com_quebra, MOTIVO_DA_FALHA), (com_escape, MOTIVO_DA_FALHA)]
+    path = config_writer(tickers=["AAPL", com_quebra, com_escape])
+    patch_quotes(monkeypatch, good=1, bad=falhas)
+
+    assert cli.main(["run", "--dry-run", "--config", str(path)]) == cli.EXIT_OK
+
+    out, err = capture(capfd)
+    assert err == ""
+    regiao = out.split("Assunto: ", 1)[0]
+    # Um ``WARNING`` por ativo com falha e mais as duas linhas ``INFO`` da execução: a
+    # contagem dos eventos vem do caminho do código.
+    assert len(log_lines(regiao)) == 2 + len(falhas)
+    # Toda linha física da região é um evento completo: nenhuma continuação órfã.
+    assert all(LOG_LINE.match(linha) for linha in regiao.splitlines())
+    assert "\x1b" not in regiao
+    avisos = lines_with_level(regiao, "WARNING")
+    assert len(avisos) == len(falhas)
+    assert f"Ativo AA\\x0aPL sem dados: {MOTIVO_DA_FALHA}." in avisos[0]
+    assert f"Ativo \\x1b[31mFAKE\\x1b[0m sem dados: {MOTIVO_DA_FALHA}." in avisos[1]
 
 
 # Codificação dos streams: a saída pt-BR não depende do locale do host (AAP 0.6.2).
@@ -1067,7 +1354,14 @@ def test_sentinela_de_senha_ausente_de_todas_as_saidas(
     sentinel_password: str,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """As três invocações reais, com a senha definida, não a ecoam em lugar algum."""
+    """As três invocações reais, com a senha definida, não a ecoam em lugar algum.
+
+    Cada uma das três varreduras vem precedida da prova de que a captura daquela
+    invocação não está vazia; sem ela, uma captura que devolvesse "" satisfaria a busca
+    de ausência sem examinar saída alguma. As duas credenciais vêm da fixture
+    ``credentials_env``, que já as define no ambiente e devolve o escritor de
+    configuração.
+    """
     path = credentials_env()
 
     def send(*args: Any, **kwargs: Any) -> None:
@@ -1083,6 +1377,17 @@ def test_sentinela_de_senha_ausente_de_todas_as_saidas(
     patch_quotes(monkeypatch, good=3)
     assert cli.main(["run", "--config", str(path)]) == cli.EXIT_SMTP
     out, err = capture(capfd)
+    # A vivacidade da captura é o que impede a varredura de ausência de passar sobre uma
+    # saída vazia: o início da execução, o ``ERROR`` da falha de entrega e a linha única
+    # de diagnóstico em ``stderr`` precisam estar aqui antes da busca.
+    falha_de_entrega = "autenticação recusada (código 535)"
+    assert lines_with_level(out, "INFO"), "a execução não registrou a linha de início"
+    assert any(falha_de_entrega in linha for linha in lines_with_level(out, "ERROR")), (
+        "o ERROR da falha de entrega não foi registrado"
+    )
+    assert any(falha_de_entrega in linha for linha in err.splitlines()), (
+        "a linha única de diagnóstico não chegou a stderr"
+    )
     assert_absent({"stdout": out, "stderr": err}, sentinel_password)
     assert sentinel_username not in out
     assert sentinel_username not in err
@@ -1090,12 +1395,22 @@ def test_sentinela_de_senha_ausente_de_todas_as_saidas(
     patch_quotes(monkeypatch, good=3)
     assert cli.main(["run", "--dry-run", "--config", str(path)]) == cli.EXIT_OK
     out, err = capture(capfd)
+    # Vivacidade: as duas linhas ``INFO`` da execução e a linha do assunto impressa.
+    assert len(lines_with_level(out, "INFO")) >= 2, "os dois INFO da execução faltaram"
+    assert any(linha.startswith("Assunto: ") for linha in out.splitlines()), (
+        "o bloco impresso não traz a linha do assunto"
+    )
     assert_absent({"stdout": out, "stderr": err}, sentinel_password)
     assert sentinel_username not in out
     assert sentinel_username not in err
 
     assert cli.main(["check-config", "--config", str(path)]) == cli.EXIT_OK
     out, err = capture(capfd)
+    # Vivacidade: o resumo validado e a linha ``INFO`` de início antes da busca.
+    assert any(linha == "Configuração válida." for linha in out.splitlines()), (
+        "o resumo validado não foi impresso"
+    )
+    assert lines_with_level(out, "INFO"), "a execução não registrou a linha de início"
     assert_absent({"stdout": out, "stderr": err}, sentinel_password)
     assert sentinel_username not in out
     assert sentinel_username not in err

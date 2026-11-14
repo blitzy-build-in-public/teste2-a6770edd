@@ -5,9 +5,17 @@ de teste, sombreando a biblioteca real do Yahoo Finance, e oferece apenas a supe
 ``finmail/quotes.py`` usa, com dados fixos e determinísticos e as mesmas colunas da biblioteca.
 """
 
+import logging
+
 import pandas as pd
 
 from .exceptions import YFPricesMissingError, YFTickerMissingError
+
+# O dublê registra deliberadamente no namespace da biblioteca real, ``yfinance`` — o mesmo
+# logger que o ``yfinance`` de verdade usa —, para que as asserções de ``stderr`` dos
+# testes de ponta a ponta exercitem o caminho do ruído: sem um destino no logger, um
+# registro ``ERROR`` chegaria a ``stderr`` por ``logging.lastResort``.
+_LOGGER = logging.getLogger("yfinance")
 
 # Colunas na ordem que a biblioteca real devolve, com o tipo de cada uma.
 _COLUMN_DTYPES: dict[str, str] = {
@@ -76,11 +84,14 @@ class Ticker:
         ``period``, ``interval``, ``auto_adjust``, ``timeout`` e os demais argumentos são
         aceitos e ignorados: os dados são fixtures offline e nenhuma requisição sai daqui.
         Para símbolo sem dados, ``raise_errors`` decide entre levantar uma exceção
-        determinística ou devolver um quadro vazio, como a biblioteca real faz.
+        determinística ou devolver um quadro vazio, como a biblioteca real faz. No ramo
+        que levanta, o registro ``ERROR`` que a biblioteca escreve antes de falhar é
+        reproduzido no mesmo logger, e nada é registrado quando o símbolo tem dados.
         """
         bars = _BARS.get(self.symbol)
         if bars is None:
             if raise_errors:
+                _log_missing_symbol(self.symbol)
                 raise _failure(self.symbol)
             return _empty_frame()
         return _build_frame(bars)
@@ -88,10 +99,12 @@ class Ticker:
     def get_history_metadata(self) -> dict[str, str]:
         """Devolve uma cópia nova do metadado fixo do símbolo simulado.
 
-        Símbolo sem dados levanta a mesma exceção determinística de :meth:`history`.
+        Símbolo sem dados registra o mesmo ``ERROR`` de :meth:`history` e levanta a
+        mesma exceção determinística.
         """
         metadata = _METADATA.get(self.symbol)
         if metadata is None:
+            _log_missing_symbol(self.symbol)
             raise _failure(self.symbol)
         return dict(metadata)
 
@@ -104,6 +117,21 @@ def download(*args: object, **kwargs: object) -> None:
     em vez de um ``AttributeError`` ou de uma requisição de rede silenciosa.
     """
     raise RuntimeError("yf.download não é usado por finmail")
+
+
+def _log_missing_symbol(symbol: str) -> None:
+    """Registra, no logger da biblioteca real, o ``ERROR`` de um símbolo sem cotação.
+
+    O texto reproduz o que o ``yfinance`` 0.2.66 escreve quando o ``quoteSummary`` do
+    símbolo responde 404 — ``str(exc) + exc.response.text`` em ``scrapers/quote.py`` —
+    para que a asserção do teste de ponta a ponta reconheça o ruído que o produto
+    precisa manter fora dos dois streams. Nenhum outro caminho do dublê registra algo.
+    """
+    _LOGGER.error(
+        'HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found",'
+        '"description":"Quote not found for symbol: %s"}}}',
+        symbol,
+    )
 
 
 def _failure(symbol: str) -> Exception:

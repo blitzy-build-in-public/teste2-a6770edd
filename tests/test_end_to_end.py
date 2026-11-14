@@ -55,6 +55,13 @@ NOT_AVAILABLE = "n/d"
 OK = "ok"
 COLUMN_SEPARATOR = " | "
 
+# Texto que o dublê registra no logger da biblioteca real, ``yfinance``, para um símbolo
+# sem cotação — o mesmo que a biblioteca de verdade escreve. É o ruído de terceiro que o
+# contrato do AAP 0.6.2 mantém fora de ``stdout`` e de ``stderr``: sem o destino nulo que
+# o produto instala nesse logger, o registro chegaria a ``stderr`` por
+# ``logging.lastResort``, e a asserção de ``stderr`` vazio abaixo passaria a falhar.
+LIBRARY_NOISE = "HTTP Error 404"
+
 # Bloco impresso por ``run --dry-run``: rótulo do assunto e delimitador do corpo.
 SUBJECT_LABEL = "Assunto: "
 DRY_RUN_DELIMITER = "--- corpo texto ---"
@@ -232,12 +239,39 @@ def test_run_entrega_uma_mensagem_com_uma_linha_por_ativo(
     assert FOOTER in text
     assert FOOTER in html
 
+    # Prova de §0.7.2 para o corpo: as credenciais são passadas em ``env`` e só
+    # podem chegar a ``smtp.login``, nunca ao corpo entregue. A varredura repete
+    # as conferências que fazem de cada parte o relatório de verdade, para que a
+    # ausência só valha sobre um corpo que de fato chegou; a falha nomeia a parte
+    # e a variável, jamais o valor procurado.
+    delivered = {"texto": text, "html": html}
+    for part_name, part_body in delivered.items():
+        assert part_body.strip(), f"corpo {part_name} vazio na mensagem recebida"
+        assert FOOTER in part_body, f"corpo {part_name} sem o rodapé de origem"
+    assert rows, "corpo texto recebido sem nenhuma linha de ativo"
+    assert html.count("<tr") > 1, "corpo html recebido sem nenhuma linha de ativo"
+
+    for variable in ("SMTP_USERNAME", "SMTP_PASSWORD"):
+        secret = credentials_env[variable]
+        for part_name, part_body in delivered.items():
+            # O booleano intermediário evita que a introspecção do ``pytest``
+            # imprima o valor procurado junto da mensagem de falha.
+            leaked = secret in part_body
+            assert not leaked, (
+                f"o valor de {variable} aparece no corpo {part_name} recebido"
+            )
+
     # Os valores vêm do dublê, não de uma consulta real ao Yahoo Finance.
     assert "Apple Inc." in text
     assert "Petróleo Brasileiro S.A. - Petrobras" in text
     assert "Microsoft Corporation" in text
 
     assert proc.stderr == ""
+    # O dublê registra no logger da biblioteca real, mas só no caminho de falha: numa
+    # execução em que todos os ativos retornam dados, o texto da biblioteca não pode
+    # aparecer em nenhum dos dois streams.
+    assert LIBRARY_NOISE not in proc.stdout, describe(proc)
+    assert LIBRARY_NOISE not in proc.stderr, describe(proc)
     # A linha INFO de progresso nomeia o caminho da configuração usada.
     assert str(path) in proc.stdout, describe(proc)
     assert "INFO" in proc.stdout
@@ -294,6 +328,15 @@ def test_run_parcial_envia_com_tres_linhas(
 
     assert "WARNING" in proc.stdout, describe(proc)
     assert "BTC-USD" in proc.stdout, describe(proc)
+    # O WARNING do produto para o ativo que falhou continua em ``stdout``, e o registro
+    # que a biblioteca de cotações escreve para o mesmo símbolo fica fora dos dois
+    # streams: é o destino nulo do logger dela que sustenta o contrato do AAP 0.6.2.
+    warning_lines = [
+        line for line in proc.stdout.splitlines() if " WARNING " in line and "BTC-USD" in line
+    ]
+    assert warning_lines, describe(proc)
+    assert LIBRARY_NOISE not in proc.stdout, describe(proc)
+    assert LIBRARY_NOISE not in proc.stderr, describe(proc)
     assert proc.stderr == ""
 
 
@@ -323,6 +366,11 @@ def test_run_todos_falham_nao_envia(
     assert "ERROR" in proc.stdout, describe(proc)
     assert f"{len(TICKERS_ALL_FAILING)} ativos com falha" in proc.stdout, describe(proc)
     assert "nenhum e-mail foi enviado" in proc.stderr, describe(proc)
+    # ``stderr`` recebe exatamente uma linha, a de diagnóstico fatal, e nem ela nem
+    # ``stdout`` trazem o registro que a biblioteca escreve para cada símbolo que falhou.
+    assert len(proc.stderr.splitlines()) == 1, describe(proc)
+    assert LIBRARY_NOISE not in proc.stdout, describe(proc)
+    assert LIBRARY_NOISE not in proc.stderr, describe(proc)
 
     # Nenhum corpo foi impresso: o caminho para antes de montar a mensagem.
     assert SUBJECT_LABEL not in proc.stdout, describe(proc)
@@ -390,4 +438,3 @@ def test_dry_run_nao_abre_conexao_smtp(
     assert "SMTP_PASSWORD" not in proc.stdout, describe(proc)
     assert "SMTP_USERNAME" not in proc.stdout, describe(proc)
     assert proc.stderr == "", describe(proc)
-

@@ -20,8 +20,10 @@ do locale do host.
 """
 
 import argparse
+import copy
 import logging
 import os
+import re
 import sys
 import warnings
 from collections.abc import Callable
@@ -44,15 +46,26 @@ EXIT_SMTP = 4
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 LOGGER_NAME = "finmail"
-# Bibliotecas cujo ruído não pode se confundir com o log do produto: o formato é
-# único para as três invocações e não existe opção de nível de log.
+# Bibliotecas cujo ruído não pode se confundir com o log do produto nem escapar para
+# ``stderr``: ficam em ``ERROR`` com destino nulo, e não existe opção de nível de log.
 QUIET_LOGGERS = ("yfinance", "peewee", "urllib3", "curl_cffi")
 
-# A biblioteca de cotações liga os próprios avisos de depreciação ao ser importada e
-# coloca o filtro dela à frente da lista. Como ``stderr`` é reservado à linha única de
-# diagnóstico fatal e às mensagens de uso, esse ruído fica ignorado por um filtro que
-# vale só para ele.
-_YFINANCE_WARNING_MODULE = r"^yfinance"
+# ``warnings.showwarning`` escreve direto em ``stderr``, o stream reservado à linha única
+# de diagnóstico fatal e às mensagens de uso; por isso os avisos das bibliotecas ficam
+# ignorados, em qualquer categoria. A lista cobre os namespaces de :data:`QUIET_LOGGERS`
+# e as bibliotecas que entram junto com a de cotações, e cada padrão é ancorado em
+# ``(?:\.|$)`` para que um módulo de nome parecido não case por prefixo.
+_THIRD_PARTY_WARNING_MODULES = r"^(?:yfinance|peewee|urllib3|curl_cffi|pandas|numpy)(?:\.|$)"
+# O produto nunca chama ``warnings.warn``: um aviso atribuído a ``finmail.*`` é um aviso
+# de biblioteca que ``stacklevel`` deslocou para fora dela, e quebraria o mesmo contrato.
+_PRODUCT_WARNING_MODULES = r"^finmail(?:\.|$)"
+# Os filtros do produto, na ordem em que são instalados em ``warnings.filters``.
+_WARNING_MODULES = (_THIRD_PARTY_WARNING_MODULES, _PRODUCT_WARNING_MODULES)
+
+# Caracteres de controle de C0, DEL e C1: um deles dividiria a linha do evento em duas
+# linhas físicas ou mudaria o estado do terminal do operador, então o formato do log os
+# escapa antes de gravar.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Variáveis de ambiente das credenciais de SMTP; só a presença é consultada aqui.
 _USERNAME_VAR = "SMTP_USERNAME"
@@ -183,7 +196,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # que converte um defeito inesperado no código de saída 1. O traceback é
         # permitido aqui porque nenhuma mensagem do produto interpola credencial.
         _LOGGER.exception("falha inesperada durante a execução")
-        print(f"falha inesperada: {exc}", file=sys.stderr)
+        # O mesmo escape de :func:`_fatal`: a linha única que o README promete em
+        # ``stderr`` não pode ser dividida por um texto vindo de fora do produto.
+        print(_escape_control_characters(f"falha inesperada: {exc}"), file=sys.stderr)
         return EXIT_UNEXPECTED
 
 
@@ -404,9 +419,11 @@ def _configure_logging(timezone: ZoneInfo | None = None) -> None:
     novo depois dela (fuso do operador), mantém um único handler e apenas
     reaponta o destino e o formatador. Reapontar o destino a cada chamada também
     mantém a saída correta quando ``sys.stdout`` é substituído entre execuções,
-    como acontece na captura dos testes. Também repõe o filtro que mantém os
-    avisos de depreciação da biblioteca de cotações fora de ``stderr``, pelo mesmo
-    motivo que os loggers de :data:`QUIET_LOGGERS` ficam em ``ERROR``.
+    como acontece na captura dos testes. Os loggers de :data:`QUIET_LOGGERS` ficam
+    em ``ERROR`` com ``propagate = False`` e um destino nulo, de modo que o ruído
+    deles não se confunda com o log do produto nem escape para ``stderr``; e o
+    filtro que mantém os avisos das bibliotecas fora de ``stderr`` é reposto a cada
+    chamada.
 
     Args:
         timezone: fuso efetivo das datas do log; ``None`` usa o fuso local.
@@ -423,32 +440,46 @@ def _configure_logging(timezone: ZoneInfo | None = None) -> None:
     handler.setFormatter(_OperatorFormatter(timezone))
 
     for name in QUIET_LOGGERS:
-        logging.getLogger(name).setLevel(logging.ERROR)
+        quiet = logging.getLogger(name)
+        quiet.setLevel(logging.ERROR)
+        quiet.propagate = False
+        # O nível sozinho não basta: sem handler na cadeia inteira, o registro que
+        # passa pelo nível é escrito em ``stderr`` por ``logging.lastResort``, o
+        # stream que o contrato reserva à linha única de diagnóstico fatal.
+        if not quiet.handlers:
+            quiet.addHandler(logging.NullHandler())
+    # Um logger de biblioteca fora de :data:`QUIET_LOGGERS` ainda propaga até a raiz;
+    # o handler nulo na raiz, quando ela não tem nenhum, fecha o mesmo caminho.
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(logging.NullHandler())
     _configure_warnings()
 
 
 def _configure_warnings() -> None:
-    """Mantém os avisos de depreciação da biblioteca de cotações fora de ``stderr``.
+    """Mantém os avisos das bibliotecas fora de ``stderr``, em qualquer categoria.
 
     ``stderr`` carrega a linha única de diagnóstico fatal e as mensagens de uso do
-    ``argparse``, nada mais. A biblioteca de cotações, porém, liga os próprios
-    avisos de depreciação quando é importada e insere o filtro dela no início da
-    lista; por isso o filtro deste produto é reposto à frente a cada chamada,
-    inclusive depois de a biblioteca entrar no processo.
+    ``argparse``, nada mais. Um aviso não passa por logger: ``warnings.showwarning``
+    escreve direto em ``stderr``, e a biblioteca de cotações ainda liga o próprio filtro
+    de depreciação quando é importada, inserindo-o no início da lista; por isso os
+    filtros deste produto são repostos à frente a cada chamada, inclusive depois de a
+    biblioteca entrar no processo.
 
-    Idempotente: cada chamada deixa uma única cópia do filtro do produto, mesmo com
+    O namespace ``finmail`` entra na lista porque o produto não emite aviso algum: um
+    aviso atribuído a um módulo do produto só pode ser um aviso de biblioteca que
+    ``stacklevel`` deslocou para fora dela, e ele quebraria o contrato do mesmo modo.
+
+    Idempotente: cada chamada deixa uma única cópia de cada filtro do produto, mesmo com
     as duas chamadas de :func:`_configure_logging` de uma execução.
     """
-    warnings.filterwarnings(
-        "ignore",
-        category=DeprecationWarning,
-        module=_YFINANCE_WARNING_MODULE,
-    )
+    for module in _WARNING_MODULES:
+        warnings.filterwarnings("ignore", module=module)
     filters = warnings.filters
-    own = filters[0]
-    # A inserção acima repete a entrada a cada chamada; manter só a primeira impede
-    # que a lista cresça a cada execução dentro do mesmo processo.
-    filters[1:] = [entry for entry in filters[1:] if entry != own]
+    own = filters[: len(_WARNING_MODULES)]
+    # As inserções acima repetem as entradas a cada chamada; manter só o primeiro par
+    # impede que a lista cresça a cada execução dentro do mesmo processo.
+    filters[len(own):] = [entry for entry in filters[len(own):] if entry not in own]
 
 
 def _stdout_handler(logger: logging.Logger) -> logging.StreamHandler:
@@ -460,6 +491,26 @@ def _stdout_handler(logger: logging.Logger) -> logging.StreamHandler:
     logger.addHandler(handler)
     return handler
 
+
+def _escape_control_characters(value: str) -> str:
+    """Troca cada caractere de controle por ``\\xNN`` em hexadecimal minúsculo.
+
+    O log do produto ocupa uma linha por evento e a linha fatal de ``stderr`` também
+    ocupa uma só: um ``\\n`` dentro de um valor interpolado dividiria o evento em duas
+    linhas físicas, e um escape ANSI mudaria o estado do terminal do operador. Todo
+    caractere imprimível — ``á``, ``ç``, ``ã`` e o travessão inclusive — passa intacto.
+
+    Idempotente: a saída é formada só por caracteres imprimíveis, então escapar de novo
+    o resultado não muda nada.
+
+    Args:
+        value: texto do produto ou vindo de fora dele, como o ticker da configuração.
+
+    Returns:
+        O mesmo texto com C0 (0x00-0x1f), DEL (0x7f) e C1 (0x80-0x9f) escritos como
+        ``\\xNN``.
+    """
+    return _CONTROL_CHARS.sub(lambda match: f"\\x{ord(match.group()):02x}", value)
 
 def _flush_stdout() -> bool:
     """Descarrega ``stdout`` e diz se a saída do comando chegou inteira ao destino.
@@ -539,12 +590,16 @@ class _StdoutHandler(logging.StreamHandler):
 
 
 class _OperatorFormatter(logging.Formatter):
-    """Formatter cujo ``asctime`` sai em ISO-8601 no fuso do operador.
+    """Formatter cujo ``asctime`` sai em ISO-8601 no fuso do operador e em uma linha.
 
     O ``logging.Formatter`` padrão converte o instante com ``time.localtime`` e
     formata o ``struct_time`` resultante, que não carrega deslocamento de fuso:
     ``%z`` sairia vazio. Aqui ``converter`` devolve um ``datetime`` já ciente do
     fuso efetivo, de modo que ``%z`` apareça na linha.
+
+    A mensagem sai com os caracteres de controle escapados, para que toda linha de log
+    tenha a forma fixa do contrato mesmo quando um valor interpolado carrega ``\\n`` ou
+    um escape ANSI.
     """
 
     def __init__(self, timezone: ZoneInfo | None) -> None:
@@ -554,6 +609,24 @@ class _OperatorFormatter(logging.Formatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         """Data e hora do registro no fuso efetivo, com o deslocamento."""
         return self.converter(record.created).strftime(datefmt or LOG_DATEFMT)
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        """A mensagem do registro com os caracteres de controle escapados.
+
+        O escape acontece antes de o formato ser aplicado, então vale para qualquer valor
+        que o produto interpole em um registro, e não só para o ticker. O ``exc_info``
+        continua sendo anexado pelo formatador base, depois da mensagem, e é isso que
+        mantém o traceback da falha inesperada em várias linhas, como o README documenta.
+
+        Args:
+            record: registro em formatação.
+
+        Returns:
+            A linha formatada, sem caractere de controle.
+        """
+        escapado = copy.copy(record)
+        escapado.message = _escape_control_characters(record.getMessage())
+        return super().formatMessage(escapado)
 
 
 def _timezone_converter(timezone: ZoneInfo | None) -> Callable[[float], datetime]:
@@ -571,11 +644,14 @@ def _timezone_converter(timezone: ZoneInfo | None) -> Callable[[float], datetime
 def _fatal(message: str) -> None:
     """Registra a falha fatal uma única vez: ``ERROR`` no log e em ``stderr``.
 
+    A linha de ``stderr`` passa pelo mesmo escape do formatador: um valor hostil vindo da
+    configuração não pode dividir a linha única que o README promete ali.
+
     Args:
         message: linha única de diagnóstico, já sem qualquer valor de credencial.
     """
     _LOGGER.error("%s", message)
-    print(message, file=sys.stderr)
+    print(_escape_control_characters(message), file=sys.stderr)
 
 
 def _count(quantity: int, singular: str, plural: str) -> str:
