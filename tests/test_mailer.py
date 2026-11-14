@@ -16,7 +16,8 @@ certificado inválido, todos os destinatários recusados e ausência de mecanism
 autenticação, a recusa parcial que não pode ser repetida, a saudação 4xx tratada
 como falha transitória, o tempo esgotado embrulhado em desconexão, a fidelidade do
 dublê às assinaturas do ``smtplib``, a identidade da mensagem entre tentativas e o
-sigilo da senha em toda saída (AAP 0.7.2 e critério 6).
+sigilo da senha em toda saída (AAP 0.7.2 e critério 6), inclusive na credencial
+não ASCII, que vira falha permanente de entrega sem ecoar o caractere recusado.
 """
 
 import email
@@ -304,7 +305,7 @@ def test_dobro_do_smtp_espelha_as_assinaturas_da_biblioteca_padrao() -> None:
     assert list(send_message_dobro.parameters)[1] == "msg"
     assert list(debuglevel_real.parameters)[1] == "debuglevel"
     assert list(debuglevel_dobro.parameters)[1] == "debuglevel"
-    # A prova comportamental: a passagem posicional que o dublê aceitaria antes.
+    # A prova comportamental: a passagem posicional precisa levantar ``TypeError``.
     with pytest.raises(TypeError):
         FakeSMTP(SMTP_HOST, SMTP_PORT).starttls(ssl.create_default_context())
 
@@ -928,6 +929,61 @@ def test_falha_4xx_persistente_nomeia_o_servidor_sem_expor_credenciais(
     for record in caplog.records:
         assert sentinel_password not in record.getMessage()
         assert sentinel_password not in repr(record.args)
+
+
+def test_credencial_nao_ascii_vira_falha_permanente_sem_ecoa_la(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    sentinel_username: str,
+) -> None:
+    """Credencial fora do ASCII: falha permanente de entrega, sem ecoar o caractere.
+
+    O ``smtplib`` monta a resposta inicial do AUTH PLAIN como ``\\0usuário\\0senha`` e
+    a codifica em ASCII sem tratar a falha, então uma senha acentuada levanta
+    ``UnicodeEncodeError`` — classe que não é ``SMTPException`` nem ``OSError`` e
+    que, sem classificação, atravessaria o tratador de :func:`send` até a captura
+    final do ``cli``. O texto dela cita o caractere recusado e a posição dele na
+    resposta, de modo que um trecho da credencial chegaria ao ``stdout`` e ao
+    ``stderr`` como defeito interno (código 1), em vez de falha de entrega
+    (código 4) sem eco algum.
+    """
+    capture_product_logs(monkeypatch, caplog)
+    senha_nao_ascii = "senha-Café-42"
+    # A falha roteirizada é a que a própria biblioteca padrão produz, não um texto
+    # escrito à mão: ``auth_plain`` monta a mesma resposta que ``auth`` codifica.
+    with pytest.raises(UnicodeEncodeError) as encode_failure:
+        ("\0%s\0%s" % (sentinel_username, senha_nao_ascii)).encode("ascii")
+    erro = encode_failure.value
+    recusado = erro.object[erro.start:erro.end]
+    escape = ascii(recusado)[1:-1]
+    _fake, instances = install_fake_smtp(monkeypatch, failure_script("login", erro))
+    waits = patch_sleep(monkeypatch)
+
+    with pytest.raises(mailer.MailError) as caught:
+        mailer.send(
+            build_test_message(), smtp_config(),
+            credentials(sentinel_username, senha_nao_ascii),
+        )
+
+    failure = caught.value
+    assert failure.reason == "as credenciais SMTP precisam conter apenas caracteres ASCII"
+    text = str(failure)
+    assert SMTP_HOST in text
+    assert str(SMTP_PORT) in text
+    assert isinstance(failure.__cause__, UnicodeEncodeError)
+    assert len(instances) == 1
+    assert waits == []
+    for renderizacao in (text, repr(failure), caplog.text):
+        assert senha_nao_ascii not in renderizacao
+        assert recusado not in renderizacao
+        assert escape not in renderizacao
+        assert "position" not in renderizacao
+    for record in caplog.records:
+        for renderizacao in (record.getMessage(), repr(record.args)):
+            assert senha_nao_ascii not in renderizacao
+            assert recusado not in renderizacao
+            assert escape not in renderizacao
+            assert "position" not in renderizacao
 
 
 def test_repr_das_credenciais_nao_expoe_a_senha(

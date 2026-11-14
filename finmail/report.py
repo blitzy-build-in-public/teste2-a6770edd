@@ -8,11 +8,12 @@ a data do assunto vem do ``datetime`` injetado pelo chamador, de modo que a mesm
 entrada produz sempre os mesmos bytes.
 
 A formatação pt-BR (vírgula decimal, ponto de milhar, sentinela ``n/d``) é feita
-aqui sem ``locale``, e nenhum valor sai pré-escapado: o escape de HTML é
+aqui sem ``locale``, e nenhum valor sai pré-escapado para HTML: o escape de HTML é
 responsabilidade do autoescape do template ``report.html.j2``, enquanto o corpo
 texto mantém os nomes literais. Todo valor de texto atravessa um único
-normalizador, que o deixa em uma linha física e sem o ``|`` do separador de
-colunas; por isso os dois corpos trazem exatamente a mesma célula.
+normalizador, que o deixa em uma linha física, livre do ``|`` do separador de
+colunas e de qualquer caractere de controle: os de espaço viram espaço e os demais
+saem como ``\\xNN``; por isso os dois corpos trazem exatamente a mesma célula.
 """
 
 import math
@@ -54,6 +55,11 @@ _GROUP_MARK = "\x00"
 # ``\s`` cobre também as quebras que ``str.splitlines`` honra além de CR e LF — ``\x85``,
 # ``\u2028`` e ``\u2029`` —, então colapsá-lo mantém uma linha física por ativo.
 _WHITESPACE = re.compile(r"\s+")
+# O que o colapso de espaço não alcança — ESC, NUL, BEL, DEL e o resto de C0/C1 —
+# chegaria ao corpo texto invisível, e ``run --dry-run`` imprime esse corpo no
+# terminal do operador, onde um ESC muda o estado da tela; por isso o normalizador
+# escreve cada um desses bytes como ``\xNN`` em vez de deixá-lo passar.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # O corpo texto separa as colunas com ``" | "``; um ``|`` trazido por um valor se
 # confunde com o separador e parte a linha em campos a mais, então todo ``|`` vira
 # barra quebrada (``¦``), que mantém o valor legível e a célula livre do separador.
@@ -191,8 +197,16 @@ def _failure_row(error: "QuoteError") -> dict[str, Any]:
 
 
 def _normalize_text(value: str) -> str:
-    """Valor em uma linha física e sem o separador de colunas do corpo texto."""
-    return _WHITESPACE.sub(" ", value).strip().replace("|", _PIPE_SUBSTITUTE)
+    """Valor em uma linha física, sem caractere de controle e sem o separador.
+
+    A ordem das três etapas importa: colapsar ``\\s+`` e depois remover as pontas
+    transforma tabulação, CR, LF e as demais quebras em um único espaço, de modo que
+    só o controle que o colapso não alcança — ESC, NUL, BEL, DEL — sai escrito como
+    ``\\xNN``; por último o ``|`` vira ``¦``, e a célula fica só com imprimíveis.
+    """
+    collapsed = _WHITESPACE.sub(" ", value).strip()
+    escaped = _CONTROL_CHARS.sub(lambda match: f"\\x{ord(match.group()):02x}", collapsed)
+    return escaped.replace("|", _PIPE_SUBSTITUTE)
 
 
 def _format_text(value: str | None) -> str:

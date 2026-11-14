@@ -260,6 +260,18 @@ def test_cada_linha_de_ativo_tem_exatamente_onze_campos() -> None:
             "dados indisponíveis: motivo ¦ com delimitador segunda linha",
             id="motivo-com-separador-e-quebra",
         ),
+        pytest.param(
+            good(name="T\x1b[8m | ACME\x1b[2J\x1b[31mCORP\x07\x00 Inc."),
+            1,
+            "T\\x1b[8m \u00a6 ACME\\x1b[2J\\x1b[31mCORP\\x07\\x00 Inc.",
+            id="nome-com-controle-c0-e-del",
+        ),
+        pytest.param(
+            QuoteError("QB2.SA", "motivo \x9bcom C1 \x7ferro"),
+            10,
+            "dados indisponíveis: motivo \\x9bcom C1 \\x7ferro",
+            id="motivo-com-controle-c1-e-del",
+        ),
     ],
 )
 def test_valor_hostil_fica_em_uma_linha_e_em_uma_coluna(
@@ -630,10 +642,9 @@ def test_ticker_e_motivo_escapados_apenas_no_html() -> None:
 
 
 def test_toda_chave_da_linha_tem_consumidor_e_todo_acesso_tem_provedor() -> None:
-    # A linha chegou a carregar ``motivo`` e ``estado`` para o mesmo fato, com só
-    # ``estado`` lido. As duas direções precisam valer: nenhuma chave emitida sem
-    # consumidor — AAP 0.15.2, todo campo do relatório alimenta os dois templates — e
-    # nenhum ``row.<nome>`` acessado sem provedor no modelo de visão de 0.5.2.
+    # As duas direções precisam valer: nenhuma chave emitida sem consumidor — AAP 0.15.2,
+    # todo campo do relatório alimenta os dois templates — e nenhum ``row.<nome>`` acessado
+    # sem provedor no modelo de visão de 0.5.2.
     sucesso = set(finmail_report._row_for_entry(good()))
     falha = set(finmail_report._row_for_entry(failure_btc()))
     consumidas: set[str] = set()

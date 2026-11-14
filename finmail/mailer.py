@@ -67,6 +67,13 @@ _UNSUPPORTED_STAGE_REASONS = {
     _STAGE_SEND_MESSAGE: "servidor não aceita endereço com caracteres não ASCII (SMTPUTF8)",
 }
 
+# O ``smtplib`` codifica a resposta inicial do AUTH em ASCII sem tratar a falha, e
+# o ``UnicodeEncodeError`` que ele levanta cita o caractere recusado e a posição
+# dele dentro dessa resposta. Como nenhum trecho da credencial pode chegar ao log
+# nem à linha fatal, o motivo entregue ao operador é esta frase fixa, sem nada da
+# exceção original.
+_NON_ASCII_CREDENTIALS_REASON = "as credenciais SMTP precisam conter apenas caracteres ASCII"
+
 
 class _UnsupportedAtStage(smtplib.SMTPNotSupportedError):
     """Ausência de uma extensão SMTP, junto com o passo que a constatou.
@@ -216,9 +223,13 @@ def _deliver(
     """Executa uma transação SMTP completa: TLS primeiro, credencial depois.
 
     Raises:
-        MailError: quando o servidor aceita a mensagem para parte dos
-            destinatários e recusa os demais; a entrega não pode ser repetida,
-            porque duplicaria o e-mail já recebido pelos aceitos.
+        MailError: quando a credencial traz caractere fora do ASCII, que o
+            ``login`` não consegue codificar e repetir não resolveria, e quando o
+            servidor aceita a mensagem para parte dos destinatários e recusa os
+            demais; a entrega não pode ser repetida, porque duplicaria o e-mail já
+            recebido pelos aceitos.
+        smtplib.SMTPException, OSError: falhas de conexão ou de transação,
+            propagadas para :func:`send` classificar a nova tentativa.
     """
     context = ssl.create_default_context()
     refused: dict[str, tuple[int, bytes]] = {}
@@ -234,6 +245,11 @@ def _deliver(
             _check_ehlo(client)
             try:
                 client.login(credentials.username, credentials.password)
+            except UnicodeEncodeError as exc:
+                # Credencial fora do ASCII não é falha de transporte: repetir a
+                # transação reenviaria o mesmo valor e falharia igual. O erro sai
+                # como falha permanente de entrega, sem citar a exceção original.
+                raise MailError(smtp.host, smtp.port, _NON_ASCII_CREDENTIALS_REASON) from exc
             except smtplib.SMTPNotSupportedError as exc:
                 raise _UnsupportedAtStage(_STAGE_LOGIN, str(exc)) from exc
             try:
