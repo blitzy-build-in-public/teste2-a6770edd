@@ -49,6 +49,33 @@ python3.12 -m venv .venv
 pip install -e ".[dev]"
 ```
 
+O bloco acima cria o ambiente virtual, ativa-o e instala o pacote em modo editável com as dependências de
+desenvolvimento. A instalação está concluída quando o pacote responde e o `--help` lista os dois
+subcomandos, terminando com código de saída `0`:
+
+```bash
+python -m finmail --help
+```
+
+```text
+usage: python -m finmail [-h] [--config CAMINHO] {run,check-config} ...
+
+Resumo diário de mercado por e-mail, com cotações do Yahoo Finance.
+
+options:
+  -h, --help          show this help message and exit
+  --config CAMINHO    caminho do arquivo de configuração (padrão:
+                      ./config.yaml)
+
+comandos:
+  {run,check-config}
+    run               consulta os ativos, monta o resumo e envia o e-mail
+    check-config      valida a configuração sem acessar a rede
+```
+
+Se esse `--help` não listar `run` e `check-config`, a instalação não foi concluída; ver a seção
+**Solução de problemas**.
+
 As dependências são fixadas em versões exatas no `pyproject.toml`, e nenhuma outra é declarada:
 
 | Grupo | Pacotes |
@@ -409,6 +436,7 @@ esperada é de 0,11 a 0,30 s por ativo, ou seja cerca de 7 s para 50 ativos.
 
 | Sintoma | Causa provável e o que fazer |
 |---|---|
+| `No module named finmail` ao executar `python -m finmail` | O interpretador em uso é outro, ou o ambiente virtual não está ativo: ative-o com `. .venv/bin/activate` e repita `pip install -e ".[dev]"` a partir da raiz do repositório. Em `cron`, use o caminho absoluto do interpretador do `.venv`, como no exemplo de agendamento. |
 | Código de saída `3` | A mensagem nomeia o campo e o motivo, por exemplo `Erro de configuração em 'recipients': lista ausente ou vazia (esperado de 1 a 20 endereços).` Corrija o `config.yaml` no campo citado. |
 | `Erro de configuração: arquivo 'X' não encontrado.` | O `--config` aponta para um caminho que não existe; em `cron`, use caminho absoluto. |
 | `Credencial ausente: variável SMTP_PASSWORD não definida.` | O ambiente do processo não tem a variável. Em `cron`, declare as duas na própria entrada. |
