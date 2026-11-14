@@ -13,6 +13,7 @@ fixtures autouse do harness bloqueiam destinos fora de loopback e removem
 """
 
 import dataclasses
+import time
 from collections.abc import Callable
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -282,6 +283,20 @@ def test_smtp_port_invalido_levanta_config_error(
     assert f"'{port}'" in message
 
 
+def test_smtp_port_presente_sem_valor_levanta_config_error(
+    config_writer: Callable[..., Path]
+) -> None:
+    """``port:`` sem valor está presente (AAP 0.7.1): não vale o padrão 587."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_writer(smtp={"port": None}))
+
+    message = str(excinfo.value)
+    assert excinfo.value.field == "smtp.port"
+    assert message.startswith("Erro de configuração em 'smtp.port':")
+    assert "sem valor" in message
+    assert "inteiro" in message
+
+
 # --- Regras de ``timezone`` ------------------------------------------------
 
 
@@ -295,6 +310,37 @@ def test_timezone_invalido_vira_config_error_citando_o_fuso(
     message = str(excinfo.value)
     assert "timezone" in message
     assert "Nao/Existe" in message
+
+
+def test_timezone_presente_sem_valor_levanta_config_error(
+    config_writer: Callable[..., Path]
+) -> None:
+    """``timezone:`` sem valor está presente: não vale o padrão do fuso."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_writer(timezone=None))
+
+    message = str(excinfo.value)
+    assert excinfo.value.field == "timezone"
+    assert message.startswith("Erro de configuração em 'timezone':")
+    assert "sem valor" in message
+    assert "nome IANA" in message
+
+
+def test_leitura_do_fuso_com_tzdata_ilegivel_vira_config_error(
+    config_writer: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Um ``OSError`` do ``ZoneInfo`` (tzdata quebrado) não escapa como traceback."""
+
+    def zoneinfo_com_falha(name):
+        raise OSError(f"tzdata indisponível para o fuso {name}")
+
+    monkeypatch.setattr("finmail.config.ZoneInfo", zoneinfo_com_falha)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_writer())
+
+    assert excinfo.value.field == "timezone"
+    assert "America/Sao_Paulo" in str(excinfo.value)
 
 
 # --- Chaves desconhecidas e credenciais no arquivo -------------------------
@@ -334,6 +380,36 @@ def test_credencial_no_bloco_smtp_e_rejeitada_como_chave_desconhecida(
     message = str(excinfo.value)
     assert "password" in message
     assert sentinel_password not in message
+
+
+@pytest.mark.parametrize("variable", ["SMTP_USERNAME", "SMTP_PASSWORD"])
+@pytest.mark.parametrize("definida", [False, True])
+def test_variavel_de_credencial_no_topo_vira_erro_de_configuracao(
+    config_writer: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel_username: str,
+    sentinel_password: str,
+    variable: str,
+    definida: bool,
+) -> None:
+    """A forma da mensagem vem da origem da falha, não do nome do campo.
+
+    A chave desconhecida existe no YAML, então o diagnóstico é de configuração
+    mesmo quando a variável de ambiente está definida (AAP 0.7.1 e 0.7.2):
+    anunciar credencial ausente seria um diagnóstico falso.
+    """
+    valor = sentinel_password if variable == "SMTP_PASSWORD" else sentinel_username
+    if definida:
+        monkeypatch.setenv(variable, valor)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_writer(**{variable: valor}))
+
+    message = str(excinfo.value)
+    assert message.startswith(f"Erro de configuração em '{variable}'")
+    assert "chave desconhecida" in message
+    assert "Credencial ausente" not in message
+    assert valor not in message
 
 
 # --- Ordem do primeiro erro ------------------------------------------------
@@ -418,6 +494,40 @@ def test_arquivo_ausente_cita_o_caminho_e_nao_encontrado(tmp_path: Path) -> None
     assert "não encontrado" in message
 
 
+def test_arquivo_que_e_diretorio_vira_config_error_em_portugues(tmp_path: Path) -> None:
+    """Um diretório em ``--config`` não pode devolver o texto do sistema em inglês."""
+    directory = tmp_path / "config.yaml"
+    directory.mkdir()
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(directory)
+
+    message = str(excinfo.value)
+    assert excinfo.value.field is None
+    assert str(directory) in message
+    assert message.endswith("o caminho é um diretório.")
+    assert "Is a directory" not in message
+
+
+def test_falha_de_leitura_generica_cita_o_codigo_do_erro(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O ramo genérico de ``OSError`` também não interpola o ``strerror``."""
+    path = tmp_path / "config.yaml"
+
+    def read_text_com_falha(self: Path, **kwargs: object) -> str:
+        raise OSError(40, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(Path, "read_text", read_text_com_falha)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert "código 40" in message
+    assert "Too many levels" not in message
+
+
 def test_yaml_invalido_cita_a_linha(config_writer: Callable[..., Path]) -> None:
     path = config_writer(raw="tickers: [AAPL\n")
 
@@ -427,6 +537,17 @@ def test_yaml_invalido_cita_a_linha(config_writer: Callable[..., Path]) -> None:
     message = str(excinfo.value)
     assert "YAML inválido" in message
     assert "linha" in message
+
+
+def test_aninhamento_profundo_vira_config_error(config_writer: Callable[..., Path]) -> None:
+    """Aninhamento além do limite do interpretador não pode escapar como traceback."""
+    path = config_writer(raw="a: " + "[" * 900 + "]" * 900 + "\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert excinfo.value.field is None
+    assert "aninhamento" in str(excinfo.value)
 
 
 def test_conteudo_que_nao_e_mapeamento_levanta_config_error(
@@ -441,6 +562,21 @@ def test_conteudo_que_nao_e_mapeamento_levanta_config_error(
     assert "mapeamento" in str(excinfo.value)
 
 
+def test_arquivo_fora_do_utf8_vira_config_error_citando_o_caminho(tmp_path: Path) -> None:
+    """Um arquivo em cp1252 não pode escapar como ``UnicodeDecodeError``."""
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"recipients:\n  - caf\xe9@exemplo.com\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert excinfo.value.field is None
+    assert str(path) in message
+    assert "UTF-8" in message
+    assert "posição 19" in message
+
+
 def test_documento_vazio_levanta_config_error(config_writer: Callable[..., Path]) -> None:
     path = config_writer(raw="")
 
@@ -449,6 +585,115 @@ def test_documento_vazio_levanta_config_error(config_writer: Callable[..., Path]
 
     assert excinfo.value.field is None
     assert "mapeamento" in str(excinfo.value)
+
+
+# --- Chaves repetidas no mesmo mapeamento ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "key", "line"),
+    [
+        pytest.param(
+            "tickers:\n  - AAPL\nrecipients:\n  - usuario1@exemplo.com\n"
+            "recipients:\n  - outro@exemplo.com\n",
+            "recipients",
+            5,
+            id="topo",
+        ),
+        pytest.param(
+            "tickers:\n  - AAPL\nrecipients:\n  - usuario1@exemplo.com\n"
+            "sender: finmail@exemplo.com\nsmtp:\n  host: smtp.exemplo.com\n"
+            "  port: 587\n  host: outro.exemplo.com\n",
+            "host",
+            9,
+            id="bloco-smtp",
+        ),
+    ],
+)
+def test_chave_duplicada_no_mesmo_mapeamento_e_rejeitada(
+    config_writer: Callable[..., Path], raw: str, key: str, line: int
+) -> None:
+    """A chave declarada duas vezes não pode ser colapsada sem diagnóstico."""
+    path = config_writer(raw=raw)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert excinfo.value.field is None
+    assert f"chave '{key}' repetida na linha {line}" in message
+
+
+def test_tag_python_no_arquivo_continua_recusada(
+    config_writer: Callable[..., Path]
+) -> None:
+    """A inspeção dos nós não pode deixar passar um documento com tag Python."""
+    path = config_writer(raw="!!python/object/apply:os.system ['echo oi']\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert excinfo.value.field is None
+    assert "YAML inválido" in str(excinfo.value)
+
+
+# --- Âncoras e apelidos no grafo de nós ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "trecho"),
+    [
+        pytest.param(
+            "a: &x [*x]\n",
+            "chave desconhecida",
+            id="alias-ciclico",
+        ),
+        pytest.param(
+            "tickers: &x [AAPL, *x]\nrecipients:\n  - usuario1@exemplo.com\n"
+            "sender: finmail@exemplo.com\nsmtp:\n  host: smtp.exemplo.com\n",
+            "item 2 não é um texto",
+            id="tickers-recorrente",
+        ),
+    ],
+)
+def test_apelido_ciclico_vira_config_error(
+    config_writer: Callable[..., Path], raw: str, trecho: str
+) -> None:
+    """Apelido que aponta para o próprio nó não pode escapar como ``RecursionError``."""
+    path = config_writer(raw=raw)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert trecho in str(excinfo.value)
+
+
+def _documento_com_apelidos(niveis: int) -> str:
+    """Documento em que cada nível cita dez vezes a âncora do nível anterior."""
+    linhas = ["a0: &a0 [1, 2]"]
+    for nivel in range(1, niveis + 1):
+        apelidos = ", ".join([f"*a{nivel - 1}"] * 10)
+        linhas.append(f"a{nivel}: &a{nivel} [{apelidos}]")
+    return "\n".join(linhas) + "\n"
+
+
+def test_apelidos_repetidos_nao_multiplicam_o_percurso(
+    config_writer: Callable[..., Path]
+) -> None:
+    """A mesma âncora repetida em cada nível não pode custar dez vezes mais por nível.
+
+    Sem o conjunto de nós visitados, oito níveis passam de vinte segundos de
+    percurso para um arquivo de poucas linhas escrito pelo operador; o limite
+    abaixo separa esse custo exponencial de uma leitura imediata.
+    """
+    path = config_writer(raw=_documento_com_apelidos(8))
+
+    inicio = time.monotonic()
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "chave desconhecida" in str(excinfo.value)
+    assert time.monotonic() - inicio < 5.0
 
 
 # --- Credenciais do ambiente -----------------------------------------------
@@ -482,6 +727,31 @@ def test_load_credentials_sem_senha_cita_a_variavel(sentinel_username: str) -> N
     message = str(excinfo.value)
     assert "SMTP_PASSWORD" in message
     assert sentinel_username not in message
+
+
+@pytest.mark.parametrize(
+    ("environ", "linha"),
+    [
+        pytest.param(
+            {},
+            "Credencial ausente: variável SMTP_USERNAME não definida.",
+            id="sem-usuario",
+        ),
+        pytest.param(
+            {"SMTP_USERNAME": "usuario@exemplo.com"},
+            "Credencial ausente: variável SMTP_PASSWORD não definida.",
+            id="sem-senha",
+        ),
+    ],
+)
+def test_load_credentials_ausente_produz_a_linha_documentada(
+    environ: dict[str, str], linha: str
+) -> None:
+    """A linha de credencial ausente da AAP 0.6.2 vem só do ambiente."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_credentials(environ)
+
+    assert str(excinfo.value) == linha
 
 
 def test_load_credentials_le_so_o_mapeamento_recebido(

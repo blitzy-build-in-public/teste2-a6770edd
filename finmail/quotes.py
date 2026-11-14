@@ -6,8 +6,8 @@ metadados) sai deste arquivo. Os valores são convertidos para tipos primitivos 
 fronteira, de modo que um ``DataFrame``, uma ``Series`` ou um ``Timestamp`` nunca
 atravessa o contrato público.
 
-Uma requisição HTTP por ativo: as barras diárias de um ano e o metadado do gráfico vêm
-da mesma chamada.
+Uma requisição de barras por ativo: o metadado do gráfico vem do acessor público do mesmo
+instrumento, e nenhuma superfície privada da biblioteca é tocada.
 """
 
 import logging
@@ -31,6 +31,11 @@ REQUEST_TIMEOUT = 10
 MAX_ATTEMPTS = 3
 RETRY_WAIT_SECONDS = 2
 HISTORY_PERIOD = "1y"
+# Falha de verificação do certificado do servidor é permanente e não é repetida. A
+# checagem é pelo nome da classe porque a biblioteca de transporte que o ``yfinance``
+# usa reporta o problema com a própria ``CertificateVerifyError``, que não é uma
+# ``ssl.SSLError`` — importá-la acrescentaria uma dependência que o projeto não declara.
+_CERTIFICATE_ERROR_NAMES = frozenset({"CertificateVerifyError", "SSLCertVerificationError"})
 
 
 @dataclass(frozen=True)
@@ -75,8 +80,8 @@ def fetch(ticker: str) -> Quote:
     Usa uma única requisição de barras diárias de um ano, da qual deriva todos os campos
     de :class:`Quote`. Falhas transitórias (rede, tempo esgotado e limite de requisições)
     são repetidas até ``MAX_ATTEMPTS`` tentativas, com ``RETRY_WAIT_SECONDS`` entre elas;
-    falhas determinísticas (ativo inexistente, ausência de preços, quadro vazio ou sem
-    ``Close``) não são repetidas.
+    falhas determinísticas (ativo inexistente, ausência de preços, quadro vazio, sem
+    ``Close`` ou certificado TLS inválido) não são repetidas.
 
     Args:
         ticker: símbolo do ativo, como ``PETR4.SA`` ou ``AAPL``.
@@ -124,7 +129,13 @@ def _history_frame(instrument: "yf.Ticker", ticker: str) -> object:
             raise QuoteError(ticker, "sem preços disponíveis no período") from exc
         except YFTickerMissingError as exc:
             raise QuoteError(ticker, "ativo não encontrado no Yahoo Finance") from exc
-        except (YFRateLimitError, OSError, TimeoutError) as exc:
+        except (YFRateLimitError, OSError) as exc:
+            if _is_certificate_failure(exc):
+                # Certificado que não verifica não passa a verificar na segunda tentativa:
+                # repetir custaria duas requisições e 4 s por ativo antes do mesmo desfecho.
+                raise QuoteError(
+                    ticker, "certificado TLS do servidor não pôde ser verificado"
+                ) from exc
             if attempt >= MAX_ATTEMPTS:
                 if isinstance(exc, YFRateLimitError):
                     raise QuoteError(
@@ -154,30 +165,34 @@ def _history_frame(instrument: "yf.Ticker", ticker: str) -> object:
     return frame
 
 
-def _cached_metadata(instrument: "yf.Ticker") -> dict:
-    """Metadado do gráfico que a consulta das barras já trouxe, sem nova requisição.
+def _is_certificate_failure(exc: BaseException) -> bool:
+    """Diz se a falha é de verificação do certificado TLS, que não se resolve repetindo."""
+    return any(cls.__name__ in _CERTIFICATE_ERROR_NAMES for cls in type(exc).__mro__)
 
-    ``get_history_metadata()`` do yfinance 0.2.66 solicita ``5d``/``1h`` sempre que o
-    metadado diário não traz ``tradingPeriods``, o que custaria uma segunda requisição por
-    ativo; por isso o metadado já carregado é lido primeiro. A chamada pública permanece
-    como reserva para quando esse metadado não estiver disponível (dublês de teste, por
-    exemplo), e qualquer falha nela apenas deixa ``name`` e ``currency`` ausentes.
+
+def _graph_metadata(instrument: "yf.Ticker", ticker: str) -> dict[str, object]:
+    """Metadado do gráfico do ativo, lido pelo acessor público da biblioteca.
+
+    ``get_history_metadata()`` do mesmo instrumento é a única fonte do metadado: é a
+    superfície que a fronteira declara, e nenhum atributo privado da biblioteca é lido. A
+    própria biblioteca pode emitir uma requisição de acompanhamento quando o metadado
+    diário não traz o calendário de negociação. Uma falha no acesso não invalida o ativo —
+    apenas deixa ``name`` e ``currency`` ausentes, porque só ``close`` é essencial —, mas a
+    causa vai para o log em ``DEBUG`` antes da degradação, em vez de desaparecer.
     """
-    price_history_loader = getattr(instrument, "_lazy_load_price_history", None)
-    cached: object = None
-    if callable(price_history_loader):
-        # O carregador só instancia o objeto de preços; a requisição já foi feita.
-        try:
-            cached = getattr(price_history_loader(), "_history_metadata", None)
-        except Exception:
-            cached = None
-    if isinstance(cached, dict) and cached:
-        return cached
     try:
         metadata = instrument.get_history_metadata()
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug("Metadado do gráfico indisponível para %s: %s.", ticker, exc)
         return {}
-    return metadata if isinstance(metadata, dict) else {}
+    if not isinstance(metadata, dict):
+        _LOGGER.debug(
+            "Metadado do gráfico de %s veio como %s, não como dicionário.",
+            ticker,
+            type(metadata).__name__,
+        )
+        return {}
+    return metadata
 
 
 def _build_quote(ticker: str, instrument: "yf.Ticker", frame: object) -> Quote:
@@ -200,10 +215,14 @@ def _build_quote(ticker: str, instrument: "yf.Ticker", frame: object) -> Quote:
         change_pct = change / previous_close * 100.0
 
     volume = _to_int(frame["Volume"].iloc[-1]) if "Volume" in columns else None
+    if volume is not None and volume < 0:
+        # Volume negativo não é uma contagem válida: é sentinela de valor ausente, então a
+        # fronteira entrega None e o relatório mostra n/d em vez de um número negativo.
+        volume = None
     week52_low = _to_float(frame["Low"].min()) if "Low" in columns else None
     week52_high = _to_float(frame["High"].max()) if "High" in columns else None
 
-    metadata = _cached_metadata(instrument)
+    metadata = _graph_metadata(instrument, ticker)
     name = _to_text(metadata.get("longName")) or _to_text(metadata.get("shortName"))
     currency = _to_text(metadata.get("currency"))
 

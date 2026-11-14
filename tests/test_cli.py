@@ -23,6 +23,7 @@ descritor de arquivo lê com confiança o que ele escreveu.
 
 import re
 import tomllib
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -616,6 +617,44 @@ def test_defeito_inesperado_sai_com_1_e_um_diagnostico_unico_em_stderr(
     assert "falha inesperada" in err
     assert "Traceback" not in err
     assert lines_with_level(out, "ERROR")
+
+
+# Disciplina de streams: a biblioteca de cotações liga os próprios avisos de depreciação
+# ao ser importada, e ``stderr`` é reservado à linha única de diagnóstico fatal e às
+# mensagens de uso (AAP 0.6.2, README).
+
+
+def test_aviso_de_depreciacao_do_yfinance_nao_chega_ao_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """O filtro de avisos do produto cobre o ``yfinance`` e nada além dele.
+
+    A prova é estrutural, sobre ``warnings.filters``, e não sobre o ``stderr``
+    capturado: o pytest envolve cada teste em um contexto de avisos próprio, no qual a
+    contagem de avisos depende da ordem e dos plugins. A lista é copiada e o
+    ``monkeypatch`` a restaura, então o teste não deixa estado global nem depende da
+    ordem dos demais.
+    """
+    monkeypatch.setattr(warnings, "filters", list(warnings.filters))
+
+    cli._configure_logging()
+    cli._configure_logging()
+
+    proprios = [
+        entrada
+        for entrada in warnings.filters
+        if entrada[0] == "ignore"
+        and entrada[2] is DeprecationWarning
+        and isinstance(entrada[3], re.Pattern)
+        and entrada[3].match("yfinance.utils")
+    ]
+    # Uma única cópia, ainda que ``_configure_logging`` seja chamada mais de uma vez.
+    assert len(proprios) == 1
+    padrao = proprios[0][3]
+    assert not padrao.match("finmail.quotes")
+    # O filtro da biblioteca já está na lista — os testes importam o ``yfinance`` junto
+    # com ``finmail.quotes`` —, e ficar à frente dele é o que cala o aviso.
+    assert warnings.filters[0] == proprios[0]
 
 
 # ``run --dry-run``: assunto e corpo texto, sem HTML e sem SMTP (AAP 0.6.2, critério 4).

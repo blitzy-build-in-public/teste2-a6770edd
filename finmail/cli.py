@@ -21,6 +21,7 @@ import argparse
 import logging
 import os
 import sys
+import warnings
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,12 @@ LOGGER_NAME = "finmail"
 # Bibliotecas cujo ruído não pode se confundir com o log do produto: o formato é
 # único para as três invocações e não existe opção de nível de log.
 QUIET_LOGGERS = ("yfinance", "peewee", "urllib3", "curl_cffi")
+
+# A biblioteca de cotações liga os próprios avisos de depreciação ao ser importada e
+# coloca o filtro dela à frente da lista. Como ``stderr`` é reservado à linha única de
+# diagnóstico fatal e às mensagens de uso, esse ruído fica ignorado por um filtro que
+# vale só para ele.
+_YFINANCE_WARNING_MODULE = r"^yfinance"
 
 # Variáveis de ambiente das credenciais de SMTP; só a presença é consultada aqui.
 _USERNAME_VAR = "SMTP_USERNAME"
@@ -160,6 +167,11 @@ def handle_run(config: finmail_config.Config, dry_run: bool) -> int:
 
     from finmail import quotes
     from finmail.report import build
+
+    # A biblioteca de cotações entra no processo aqui e, na importação, repõe à frente
+    # da lista o filtro de avisos de depreciação dela; refazer o filtro do produto
+    # depois disso é o que mantém esse ruído fora de ``stderr``.
+    _configure_warnings()
 
     entries: list[quotes.Quote | quotes.QuoteError] = []
     successes = 0
@@ -319,7 +331,9 @@ def _configure_logging(timezone: ZoneInfo | None = None) -> None:
     novo depois dela (fuso do operador), mantém um único handler e apenas
     reaponta o destino e o formatador. Reapontar o destino a cada chamada também
     mantém a saída correta quando ``sys.stdout`` é substituído entre execuções,
-    como acontece na captura dos testes.
+    como acontece na captura dos testes. Também repõe o filtro que mantém os
+    avisos de depreciação da biblioteca de cotações fora de ``stderr``, pelo mesmo
+    motivo que os loggers de :data:`QUIET_LOGGERS` ficam em ``ERROR``.
 
     Args:
         timezone: fuso efetivo das datas do log; ``None`` usa o fuso local.
@@ -337,6 +351,31 @@ def _configure_logging(timezone: ZoneInfo | None = None) -> None:
 
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.ERROR)
+    _configure_warnings()
+
+
+def _configure_warnings() -> None:
+    """Mantém os avisos de depreciação da biblioteca de cotações fora de ``stderr``.
+
+    ``stderr`` carrega a linha única de diagnóstico fatal e as mensagens de uso do
+    ``argparse``, nada mais. A biblioteca de cotações, porém, liga os próprios
+    avisos de depreciação quando é importada e insere o filtro dela no início da
+    lista; por isso o filtro deste produto é reposto à frente a cada chamada,
+    inclusive depois de a biblioteca entrar no processo.
+
+    Idempotente: cada chamada deixa uma única cópia do filtro do produto, mesmo com
+    as duas chamadas de :func:`_configure_logging` de uma execução.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        module=_YFINANCE_WARNING_MODULE,
+    )
+    filters = warnings.filters
+    own = filters[0]
+    # A inserção acima repete a entrada a cada chamada; manter só a primeira impede
+    # que a lista cresça a cada execução dentro do mesmo processo.
+    filters[1:] = [entry for entry in filters[1:] if entry != own]
 
 
 def _stdout_handler(logger: logging.Logger) -> logging.StreamHandler:

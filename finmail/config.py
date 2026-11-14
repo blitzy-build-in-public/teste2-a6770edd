@@ -15,18 +15,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from email.utils import parseaddr
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_CONFIG_PATH = Path("./config.yaml")
 
 _SMTP_USERNAME_VAR = "SMTP_USERNAME"
 _SMTP_PASSWORD_VAR = "SMTP_PASSWORD"
-_CREDENTIAL_VARS = frozenset({_SMTP_USERNAME_VAR, _SMTP_PASSWORD_VAR})
 
 _DEFAULT_SMTP_PORT = 587
 _DEFAULT_TIMEZONE = "America/Sao_Paulo"
+# Marcador de chave ausente: ``Mapping.get`` devolve ``None`` tanto para a chave
+# que não existe quanto para a que existe sem valor, e só a primeira usa o
+# padrão — ``port:`` e ``timezone:`` sem valor estão presentes e são recusados.
+_AUSENTE = object()
 _MAX_TICKERS = 50
 _MAX_RECIPIENTS = 20
 _TOP_LEVEL_KEYS = frozenset({"tickers", "recipients", "sender", "smtp", "timezone"})
@@ -42,28 +45,37 @@ class ConfigError(Exception):
 
     ``field`` nomeia a chave de configuração (ou a variável de ambiente) que
     falhou e ``reason`` diz o que está errado, em português. ``str(exc)`` é a
-    única linha que o operador vê, e assume uma de três formas:
+    única linha que o operador vê, e a forma é escolhida pela origem da falha,
+    nunca pelo nome do campo: uma chave de YAML pode ter qualquer nome.
 
     - ``field is None``: ``Erro de configuração: <reason>``, para falhas do
       arquivo inteiro (ausente, YAML inválido, raiz que não é mapeamento).
-    - ``field`` é chave de configuração: ``Erro de configuração em
-      '<field>': <reason>``.
-    - ``field`` é ``SMTP_USERNAME`` ou ``SMTP_PASSWORD``: ``Credencial ausente:
-      variável <field> <reason>.``, que com ``reason="não definida"`` produz a
-      linha de credencial ausente documentada para o operador. É esta a
-      reconciliação entre o contrato ``ConfigError(<variável>, reason)`` e o
-      texto de credencial: a variável é o próprio campo, sem atributo extra.
+    - ``credencial=True``: ``Credencial ausente: variável <field> <reason>.``,
+      a linha de credencial de ambiente ausente, que com ``reason="não
+      definida"`` produz o texto documentado para o operador. Só
+      :func:`load_credentials` levanta desta forma.
+    - caso contrário: ``Erro de configuração em '<field>': <reason>``. Vale
+      também para a chave desconhecida que por acaso se chame
+      ``SMTP_USERNAME`` ou ``SMTP_PASSWORD``: ela é rejeitada como chave
+      desconhecida, e a mensagem não pode anunciar credencial ausente.
     """
 
-    def __init__(self, field: str | None, reason: str) -> None:
+    def __init__(
+        self,
+        field: str | None,
+        reason: str,
+        *,
+        credencial: bool = False,
+    ) -> None:
         self.field = field
         self.reason = reason
+        self._credencial = credencial
         super().__init__(self._message())
 
     def _message(self) -> str:
         if self.field is None:
             return f"Erro de configuração: {self.reason}"
-        if self.field in _CREDENTIAL_VARS:
+        if self._credencial:
             return f"Credencial ausente: variável {self.field} {self.reason}."
         return f"Erro de configuração em '{self.field}': {self.reason}"
 
@@ -115,8 +127,9 @@ def load_config(path: Path) -> Config:
         A configuração validada, com tuplas no lugar de listas.
 
     Raises:
-        ConfigError: arquivo ausente ou ilegível, YAML inválido, conteúdo que
-            não é mapeamento, chave desconhecida ou campo fora das regras.
+        ConfigError: arquivo ausente, ilegível ou fora do UTF-8, YAML inválido com
+            a linha, chave repetida no mesmo mapeamento, conteúdo que não é
+            mapeamento, chave desconhecida ou campo fora das regras.
     """
     # O --config chega da linha de comando como texto: normalizar aqui evita que
     # um caminho str vire AttributeError em vez de erro de configuração.
@@ -164,20 +177,101 @@ def load_credentials(environ: Mapping[str, str] | None = None) -> Credentials:
 
 def _read_mapping(path: Path) -> Mapping[str, object]:
     try:
-        with path.open(encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise ConfigError(None, f"arquivo '{path}' não encontrado.") from exc
-    except yaml.YAMLError as exc:
-        raise ConfigError(None, _yaml_problem(exc)) from exc
+    except UnicodeDecodeError as exc:
+        # ``exc.reason`` e ``str(exc)`` são textos do interpretador, em inglês: a
+        # mensagem cita só a posição, que é um inteiro.
+        raise ConfigError(
+            None,
+            f"não foi possível ler o arquivo '{path}': o conteúdo não está em UTF-8 "
+            f"(primeiro byte inválido na posição {exc.start}).",
+        ) from exc
+    except IsADirectoryError as exc:
+        raise ConfigError(
+            None,
+            f"não foi possível ler o arquivo '{path}': o caminho é um diretório.",
+        ) from exc
+    except NotADirectoryError as exc:
+        raise ConfigError(
+            None,
+            f"não foi possível ler o arquivo '{path}': parte do caminho não é um diretório.",
+        ) from exc
+    except PermissionError as exc:
+        raise ConfigError(
+            None,
+            f"não foi possível ler o arquivo '{path}': permissão negada.",
+        ) from exc
     except OSError as exc:
-        detail = exc.strerror or str(exc)
-        raise ConfigError(None, f"não foi possível ler o arquivo '{path}': {detail}.") from exc
+        # O texto do sistema chega em inglês (``exc.strerror``): a mensagem cita
+        # apenas o código numérico do erro.
+        code = "desconhecido" if exc.errno is None else str(exc.errno)
+        raise ConfigError(
+            None,
+            f"não foi possível ler o arquivo '{path}': falha de leitura do sistema "
+            f"de arquivos (código {code}).",
+        ) from exc
+    data = _load_document(text)
     if data is None:
         raise ConfigError(None, _ROOT_KEYS_HINT)
     if not isinstance(data, Mapping):
         raise ConfigError(None, f"{_ROOT_KEYS_HINT}, recebido {_type_label(data)}")
     return data
+
+
+def _load_document(text: str) -> object:
+    # ``yaml.safe_load`` mantém apenas o último valor de uma chave declarada duas
+    # vezes, então a repetição — o mesmo tipo de erro de digitação que a rejeição
+    # de chave desconhecida existe para revelar — é detectada antes, sobre o
+    # grafo de nós do ``yaml.compose``. O ``safe_load`` continua sendo o único
+    # construtor de valores: um documento com tag Python é recusado por ele.
+    try:
+        _reject_repeated_keys(yaml.compose(text))
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(None, _yaml_problem(exc)) from exc
+    except RecursionError as exc:
+        # Aninhamento além do limite do interpretador esgota a pilha do próprio
+        # PyYAML: continua sendo configuração inválida, com uma linha, e não um
+        # defeito do programa.
+        raise ConfigError(
+            None,
+            "YAML inválido: aninhamento profundo demais para ser lido.",
+        ) from exc
+
+
+def _reject_repeated_keys(node: yaml.Node | None) -> None:
+    # O ``yaml.compose`` devolve um grafo, não uma árvore: a âncora ``&x``
+    # reaproveita o mesmo nó em cada apelido ``*x`` e um apelido pode voltar a um
+    # nó que ainda está sendo percorrido. O conjunto de nós já visitados encerra
+    # a busca no ciclo e impede que uma âncora repetida multiplique o trabalho;
+    # a repetição de chave é propriedade do próprio mapeamento, então continua
+    # sendo encontrada na primeira visita.
+    _walk_repeated_keys(node, set())
+
+
+def _walk_repeated_keys(node: yaml.Node | None, visited: set[int]) -> None:
+    # Chave composta (``[a, b]: x``) chega como ``SequenceNode`` e não é
+    # comparada; o documento vazio compõe para ``None``.
+    if node is None or id(node) in visited:
+        return
+    visited.add(id(node))
+    if isinstance(node, yaml.MappingNode):
+        seen: set[str] = set()
+        for key_node, value_node in node.value:
+            if isinstance(key_node, yaml.ScalarNode):
+                if key_node.value in seen:
+                    line = key_node.start_mark.line + 1
+                    raise ConfigError(
+                        None,
+                        f"chave '{key_node.value}' repetida na linha {line}.",
+                    )
+                seen.add(key_node.value)
+            _walk_repeated_keys(value_node, visited)
+    elif isinstance(node, yaml.SequenceNode):
+        for item in node.value:
+            _walk_repeated_keys(item, visited)
 
 
 def _yaml_problem(exc: yaml.YAMLError) -> str:
@@ -364,12 +458,18 @@ def _parse_smtp(root: Mapping[str, object]) -> SmtpConfig:
     host = host.strip()
     if not host:
         raise ConfigError("smtp.host", "host vazio.")
-    return SmtpConfig(host=host, port=_parse_port(raw.get("port")))
+    return SmtpConfig(host=host, port=_parse_port(raw.get("port", _AUSENTE)))
 
 
 def _parse_port(value: object) -> int:
-    if value is None:
+    if value is _AUSENTE:
         return _DEFAULT_SMTP_PORT
+    if value is None:
+        raise ConfigError(
+            "smtp.port",
+            "chave presente sem valor (esperado um inteiro entre 1 e 65535; "
+            f"remova a chave para usar o padrão {_DEFAULT_SMTP_PORT}).",
+        )
     # bool é subclasse de int: `port: true` não pode virar a porta 1.
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         raise ConfigError(
@@ -380,9 +480,15 @@ def _parse_port(value: object) -> int:
 
 
 def _parse_timezone(root: Mapping[str, object]) -> tuple[str, ZoneInfo]:
-    raw = root.get("timezone")
-    if raw is None:
+    raw = root.get("timezone", _AUSENTE)
+    if raw is _AUSENTE:
         name = _DEFAULT_TIMEZONE
+    elif raw is None:
+        raise ConfigError(
+            "timezone",
+            "chave presente sem valor (esperado um nome IANA, como "
+            f"'{_DEFAULT_TIMEZONE}'; remova a chave para usar o padrão).",
+        )
     elif not isinstance(raw, str):
         raise ConfigError(
             "timezone",
@@ -397,7 +503,7 @@ def _parse_timezone(root: Mapping[str, object]) -> tuple[str, ZoneInfo]:
             )
     try:
         zone = ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
         raise ConfigError(
             "timezone",
             f"fuso horário '{name}' não reconhecido "
@@ -409,8 +515,8 @@ def _parse_timezone(root: Mapping[str, object]) -> tuple[str, ZoneInfo]:
 def _required_variable(environ: Mapping[str, str], name: str) -> str:
     value = environ.get(name)
     if value is None or value == "":
-        raise ConfigError(name, "não definida")
+        raise ConfigError(name, "não definida", credencial=True)
     if not value.strip():
-        raise ConfigError(name, "vazia")
+        raise ConfigError(name, "vazia", credencial=True)
     return value
 

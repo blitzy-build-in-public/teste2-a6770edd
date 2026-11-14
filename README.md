@@ -317,7 +317,8 @@ execução com código diferente de `0` pode gerar alerta.
   `Falha ao enviar o e-mail para smtp.exemplo.com:587: autenticação recusada (código 535).`
 - **A coleta de cotações tem uma política própria**: até três tentativas com esperas de 2 s, apenas para
   falha de rede, tempo esgotado e limite de requisições do Yahoo. Erros determinísticos — ativo
-  inexistente, ausência de preços no período, série vazia — não são repetidos.
+  inexistente, ausência de preços no período, série vazia, campo essencial ausente e certificado TLS
+  inválido — não são repetidos.
 
 ## Execução parcial
 

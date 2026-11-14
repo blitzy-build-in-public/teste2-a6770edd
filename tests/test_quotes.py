@@ -2,9 +2,9 @@
 
 AAP 0.7.3 fixa a origem de cada campo de ``Quote`` e a política de retentativa; AAP 0.2.1
 fixa a superfície da requisição — uma única chamada ``history`` por ativo, com
-``raise_errors=True``, nunca ``yf.download`` e nunca ``Ticker.info``; AAP 0.5.2 fixa o
-contrato de tipos, em que só ``close`` é obrigatório e nenhum tipo do ``pandas``
-atravessa a fronteira do adaptador.
+``raise_errors=True``, nunca ``yf.download``, nunca ``Ticker.info`` e nunca um atributo
+privado da biblioteca; AAP 0.5.2 fixa o contrato de tipos, em que só ``close`` é obrigatório
+e nenhum tipo do ``pandas`` atravessa a fronteira do adaptador.
 
 Nada aqui toca a rede nem espera de verdade: antes de cada ``fetch``, o módulo
 ``yfinance`` que o adaptador importa é substituído por um dublê local e a função de
@@ -16,10 +16,10 @@ que o próprio adaptador chama.
 import ast
 import dataclasses
 import datetime
+import logging
 import math
 import pathlib
 from collections.abc import Callable
-from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -55,35 +55,51 @@ TOTAL_ATTEMPTS = 3
 PRIMITIVE_TYPES = {float, int, str, datetime.date, type(None)}
 
 
+class CertificateVerifyError(ConnectionError):
+    """Certificado do servidor recusado; herda de ``ConnectionError``, como na real.
+
+    Reproduz a relação de herança da falha de certificado do transporte que o ``yfinance``
+    usa — certificado → ``SSLError`` → ``ConnectionError`` → ``OSError`` — sem importar a
+    biblioteca de transporte, que não é dependência declarada do projeto.
+    """
+
+
 class RecordingTicker:
     """Dublê do ``yfinance.Ticker``: registra a requisição e segue um roteiro.
 
     O roteiro é uma lista de resultados: um ``BaseException`` é levantado, qualquer
     outro valor é devolvido como o quadro de barras. Com um único item na lista ele é
     reutilizado, de modo que "sempre falha" e "sempre devolve o mesmo quadro" não
-    precisam de listas do tamanho das tentativas.
+    precisam de listas do tamanho das tentativas. O metadado segue a mesma regra: uma
+    exceção guardada é levantada pelo acessor público e um valor que não é dicionário volta
+    como veio, para exercitar a degradação da fronteira.
     """
 
     def __init__(
         self,
         symbol: str,
         outcomes: list[object],
-        metadata: dict[str, object] | None = None,
-        cached_metadata: dict[str, object] | None = None,
+        metadata: object = None,
     ) -> None:
         self.symbol = symbol
         self.history_calls: list[dict[str, object]] = []
         self.metadata_calls = 0
         self.info_accessed = False
         self._outcomes = list(outcomes)
-        self._metadata = dict(metadata or {})
-        if cached_metadata is not None:
-            # Superfície que o adaptador lê para não repetir a requisição do metadado:
-            # o objeto de preços já carregado guarda o metadado do gráfico.
-            cached = dict(cached_metadata)
-            self._lazy_load_price_history = lambda: SimpleNamespace(  # noqa: E731
-                _history_metadata=cached
-            )
+        self._metadata = {} if metadata is None else metadata
+
+    def __getattr__(self, name: str) -> object:
+        """Proíbe qualquer atributo privado do ``yfinance`` (AAP 0.5.1).
+
+        O dublê oferece apenas a superfície declarada — ``history`` e
+        ``get_history_metadata`` —, então a leitura de um atributo privado
+        (``_lazy_load_price_history``, ``_history_metadata``) quebra o teste em vez de
+        passar despercebida. Nome público ausente continua levantando ``AttributeError``,
+        como em qualquer objeto, e o mesmo vale para os métodos especiais.
+        """
+        if name.startswith("_") and not name.startswith("__"):
+            raise AssertionError(f"atributo privado do yfinance acessado: {name}")
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     @property
     def info(self) -> object:
@@ -99,10 +115,17 @@ class RecordingTicker:
             raise outcome
         return outcome
 
-    def get_history_metadata(self) -> dict[str, object]:
-        """Metadado do gráfico que acompanha as barras; conta as chamadas."""
+    def get_history_metadata(self) -> object:
+        """Metadado do gráfico que acompanha as barras; conta as chamadas.
+
+        Uma exceção guardada é levantada e um metadado que não é dicionário é devolvido
+        como veio: é assim que o teste força a falha e o formato inesperado do acessor
+        público. Um dicionário sai como cópia, para o adaptador não alterar o original.
+        """
         self.metadata_calls += 1
-        return dict(self._metadata)
+        if isinstance(self._metadata, BaseException):
+            raise self._metadata
+        return dict(self._metadata) if isinstance(self._metadata, dict) else self._metadata
 
 
 class FakeYf:
@@ -111,22 +134,15 @@ class FakeYf:
     def __init__(
         self,
         outcomes: list[object],
-        metadata: dict[str, object] | None = DEFAULT_METADATA,
-        cached_metadata: dict[str, object] | None = None,
+        metadata: object = DEFAULT_METADATA,
     ) -> None:
         self._outcomes = list(outcomes)
         self._metadata = metadata
-        self._cached_metadata = cached_metadata
         self.created: list[RecordingTicker] = []
 
     def Ticker(self, symbol: str) -> RecordingTicker:  # noqa: N802 - nome da biblioteca
         """Cria o instrumento dublê e guarda a instância para as asserções."""
-        instrument = RecordingTicker(
-            symbol,
-            self._outcomes,
-            metadata=self._metadata,
-            cached_metadata=self._cached_metadata,
-        )
+        instrument = RecordingTicker(symbol, self._outcomes, metadata=self._metadata)
         self.created.append(instrument)
         return instrument
 
@@ -184,11 +200,10 @@ def frame(
 def install_fake_yf(
     monkeypatch: pytest.MonkeyPatch,
     outcomes: list[object],
-    metadata: dict[str, object] | None = DEFAULT_METADATA,
-    cached_metadata: dict[str, object] | None = None,
+    metadata: object = DEFAULT_METADATA,
 ) -> FakeYf:
     """Substitui o ``yfinance`` do adaptador e devolve o dublê instalado."""
-    fake = FakeYf(outcomes, metadata=metadata, cached_metadata=cached_metadata)
+    fake = FakeYf(outcomes, metadata=metadata)
     monkeypatch.setattr(quotes, "yf", fake)
     return fake
 
@@ -208,16 +223,10 @@ def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def fetch_quote(
     monkeypatch: pytest.MonkeyPatch,
     outcomes: list[object],
-    metadata: dict[str, object] | None = DEFAULT_METADATA,
-    cached_metadata: dict[str, object] | None = None,
+    metadata: object = DEFAULT_METADATA,
 ) -> Quote:
     """Instala o dublê, neutraliza a espera e devolve a cotação de ``TICKER``."""
-    fake = install_fake_yf(
-        monkeypatch,
-        outcomes,
-        metadata=metadata,
-        cached_metadata=cached_metadata,
-    )
+    fake = install_fake_yf(monkeypatch, outcomes, metadata=metadata)
     patch_sleep(monkeypatch)
     quote = fetch(TICKER)
     # ``Ticker.info`` é vetado em todo caminho: o adaptador tem de viver da requisição
@@ -367,6 +376,26 @@ def test_volume_nan_vira_none(monkeypatch: pytest.MonkeyPatch) -> None:
     assert quote.close == 13.0
 
 
+def test_volume_negativo_vira_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Volume negativo é sentinela de ausência: vira ``None``, nunca contagem negativa.
+
+    O ativo segue válido porque só ``close`` é essencial: o relatório mostra ``n/d`` na
+    coluna de volume e mantém as demais colunas.
+    """
+    bars = frame(CLOSES, lows=LOWS, highs=HIGHS, volumes=[100.0, 200.0, -5.0])
+    quote = fetch_quote(monkeypatch, [bars])
+
+    assert quote.volume is None
+    assert quote.close == 13.0
+    assert quote.change == pytest.approx(1.0)
+    assert quote.change_pct == pytest.approx(1.0 / 12.0 * 100.0)
+    assert quote.week52_low == pytest.approx(9.0)
+    assert quote.week52_high == pytest.approx(14.0)
+    assert quote.last_trading_date == LAST_TRADING_DATE
+    assert quote.name == "Apple Inc."
+    assert quote.currency == "USD"
+
+
 def test_high_nan_isolado_nao_contamina_a_maxima(monkeypatch: pytest.MonkeyPatch) -> None:
     """Uma barra sem ``High`` não apaga a faixa das demais.
 
@@ -453,18 +482,69 @@ def test_parametros_da_requisicao_sao_os_documentados(monkeypatch: pytest.Monkey
     ]
 
 
-def test_metadado_ja_carregado_dispensa_segunda_requisicao(monkeypatch: pytest.MonkeyPatch) -> None:
-    """O metadado que a própria consulta trouxe é usado antes de pedir de novo."""
-    cached = {"longName": "Petróleo Brasileiro S.A. - Petrobras", "currency": "BRL"}
-    fake = install_fake_yf(monkeypatch, [frame(CLOSES)], metadata={}, cached_metadata=cached)
+def test_metadado_vem_do_acessor_publico(monkeypatch: pytest.MonkeyPatch) -> None:
+    """O acessor público é a única fonte do metadado: um por ativo, e nada além dele.
+
+    O dublê não oferece nenhum atributo privado do ``yfinance`` — qualquer leitura deles
+    levanta ``AssertionError`` —, então nome e moeda só podem vir de
+    ``get_history_metadata()``.
+    """
+    metadata = {"longName": "Petróleo Brasileiro S.A. - Petrobras", "currency": "BRL"}
+    fake = install_fake_yf(monkeypatch, [frame(CLOSES)], metadata=metadata)
     patch_sleep(monkeypatch)
 
     quote = fetch(TICKER)
 
     assert quote.name == "Petróleo Brasileiro S.A. - Petrobras"
     assert quote.currency == "BRL"
-    assert len(fake.history_calls) == 1
-    assert fake.created[0].metadata_calls == 0
+    assert len(fake.created) == 1
+    assert len(fake.created[0].history_calls) == 1
+    assert fake.created[0].metadata_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        pytest.param(
+            RuntimeError("metadado indisponível no teste"),
+            "metadado indisponível no teste",
+            id="acessor-levanta",
+        ),
+        pytest.param(["não é dicionário"], "list", id="acessor-devolve-outro-tipo"),
+    ],
+)
+def test_metadado_indisponivel_degrada_com_a_causa_no_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    metadata: object,
+    expected: str,
+) -> None:
+    """Sem metadado o ativo continua válido, e a causa vai para o log em ``DEBUG``.
+
+    AAP 0.7.3 mantém o ativo porque só ``close`` é essencial; AAP 0.15.1 proíbe a captura
+    que descarta a causa, então a linha do log precisa nomear o ativo e trazer o motivo da
+    falha — de exceção ou de tipo inesperado — em vez de a degradação ficar invisível.
+    """
+    # O ``cli`` desliga a propagação no logger ``finmail``; reativá-la aqui mantém a captura
+    # do teste independente de outro módulo já ter configurado o log.
+    monkeypatch.setattr(logging.getLogger("finmail"), "propagate", True)
+    fake = install_fake_yf(monkeypatch, [frame(CLOSES)], metadata=metadata)
+    patch_sleep(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG, logger="finmail.quotes"):
+        quote = fetch(TICKER)
+
+    assert quote.name is None
+    assert quote.currency is None
+    assert quote.close == 13.0
+    assert quote.last_trading_date == LAST_TRADING_DATE
+    # O acessor público foi consultado uma vez: a degradação não vem de outro caminho.
+    assert fake.created[0].metadata_calls == 1
+
+    messages = [
+        record.getMessage() for record in caplog.records if record.name == "finmail.quotes"
+    ]
+    assert any(TICKER in message and expected in message for message in messages)
 
 
 # --- Política de retentativa: 3 tentativas, 2 s entre elas (AAP 0.7.3) -----------
@@ -504,6 +584,22 @@ def test_limite_de_requisicoes_tambem_e_repetido(monkeypatch: pytest.MonkeyPatch
     assert waits == RETRY_WAITS
     assert excinfo.value.ticker == TICKER
     assert "3" in excinfo.value.reason
+
+
+def test_certificado_invalido_nao_e_repetido(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Certificado que não verifica é permanente: uma chamada, nenhuma espera."""
+    fake = install_fake_yf(monkeypatch, [CertificateVerifyError("certificate verify failed")])
+    waits = patch_sleep(monkeypatch)
+
+    with pytest.raises(QuoteError) as excinfo:
+        fetch(TICKER)
+
+    assert_single_attempt(fake, waits)
+    assert excinfo.value.ticker == TICKER
+    # O motivo nomeia o certificado, para o operador diagnosticar o host sem os 4 s de
+    # espera que a classificação anterior gastava antes do mesmo desfecho.
+    assert "certificado" in excinfo.value.reason.lower()
+    assert "\n" not in excinfo.value.reason
 
 
 def test_sucesso_na_terceira_tentativa_devolve_a_cotacao(monkeypatch: pytest.MonkeyPatch) -> None:
