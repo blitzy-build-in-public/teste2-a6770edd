@@ -50,6 +50,7 @@ HTML_HEADERS = (
 )
 
 _ROW_TAG = re.compile(r"<tr[^>]*>")
+_CELL_TAG = re.compile(r"<td[^>]*>")
 _CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
 
 
@@ -138,6 +139,11 @@ def row_tags(html: str) -> list[str]:
 def row_cells(html: str, index: int) -> list[str]:
     """Os ``<td>`` da linha ``index`` do documento; ``0`` é a linha do cabeçalho."""
     return [cell.strip() for cell in _CELL.findall(html.split("</tr>")[index])]
+
+
+def cell_tags(html: str, index: int) -> list[str]:
+    """As tags de abertura ``<td>`` das células da linha ``index``, sem os valores."""
+    return _CELL_TAG.findall(html.split("</tr>")[index])
 
 
 # --- Assunto (AAP 0.5.4) -------------------------------------------------------
@@ -352,28 +358,58 @@ def test_html_e_autocontido_e_identificado_em_pt_br() -> None:
 # --- Direção da variação e cor (AAP 0.5.4 "Semântica de variação") ------------
 
 
+def test_variacao_ausente_vira_nd() -> None:
+    # AAP 0.8 "Preço anterior ausente": sem sessão anterior não há variação, as duas
+    # células mostram ``n/d`` e a linha segue na posição configurada, sem exceção.
+    sem_variacao = good(change=None, change_pct=None)
+    report = build([quote_petr4(), sem_variacao], NOW)
+    fields = asset_fields(report)[1]
+    cells = row_cells(report.html, 2)
+    tags = cell_tags(report.html, 2)
+
+    # As demais colunas continuam intactas nos dois corpos e a linha não se esconde.
+    assert fields[0] == "AAPL"
+    assert fields[4] == "358,43"
+    assert fields[10] == "ok"
+    assert cells[4] == "358,43"
+    assert cells[10] == "ok"
+    # A ausência não vira zero: o ``n/d`` substitui a variação nos dois corpos.
+    assert fields[5] == ND
+    assert fields[6] == ND
+    assert cells[5] == ND
+    assert cells[6] == ND
+    # O cinza de 0.5.4 fica nas duas células de variação; a linha não recebe classe.
+    assert tags[5] == '<td class="num neutro">'
+    assert tags[6] == '<td class="num neutro">'
+    assert row_tags(report.html)[2] == "<tr>"
+
+
 @pytest.mark.parametrize(
-    ("change", "change_pct", "row_class", "variacao", "variacao_pct"),
+    ("change", "change_pct", "classe", "variacao", "variacao_pct"),
     [
         (3.55, 1.0, "positivo", "+3,55", "+1,00%"),
         (-0.49, -1.1, "negativo", "-0,49", "-1,10%"),
         (0.0, 0.0, "neutro", "0,00", "0,00%"),
-        (None, None, "neutro", ND, ND),
     ],
 )
-def test_direcao_da_variacao_no_html_e_sinal_no_texto(
-    change: float | None,
-    change_pct: float | None,
-    row_class: str,
+def test_direcao_positiva_negativa_zero(
+    change: float,
+    change_pct: float,
+    classe: str,
     variacao: str,
     variacao_pct: str,
 ) -> None:
     quote = good(change=change, change_pct=change_pct)
     report = build([quote], NOW)
     fields = asset_fields(report)[0]
+    tags = cell_tags(report.html, 1)
 
+    # A cor descreve a variação: fica nas duas células dela, nunca na linha, de modo
+    # que Fechamento, Volume e Estado não herdem o verde/vermelho nem o cinza.
+    assert tags[5] == f'<td class="num {classe}">'
+    assert tags[6] == f'<td class="num {classe}">'
+    assert row_tags(report.html)[1] == "<tr>"
     # O tipo da variação nunca depende só da cor: o texto carrega o mesmo sinal.
-    assert row_class in row_tags(report.html)[1]
     assert fields[5] == variacao
     assert fields[6] == variacao_pct
 

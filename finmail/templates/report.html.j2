@@ -67,15 +67,15 @@
       </tr>
     </thead>
     <tbody>
-      {% for row in rows %}{% set state = "falha" if row.falha else row.direcao %}
-      <tr class="{{ state }}">
+      {% for row in rows %}
+      <tr{% if row.falha %} class="falha"{% endif %}>
         <td>{{ row.ticker }}</td>
         <td>{{ row.nome }}</td>
         <td>{{ row.moeda }}</td>
         <td>{{ row.data }}</td>
         <td class="num">{{ row.fechamento }}</td>
-        <td class="num {{ state }}">{{ row.variacao }}</td>
-        <td class="num {{ state }}">{{ row.variacao_pct }}</td>
+        <td class="num {{ row.direcao }}">{{ row.variacao }}</td>
+        <td class="num {{ row.direcao }}">{{ row.variacao_pct }}</td>
         <td class="num">{{ row.volume }}</td>
         <td class="num">{{ row.min52 }}</td>
         <td class="num">{{ row.max52 }}</td>

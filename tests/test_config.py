@@ -13,6 +13,7 @@ fixtures autouse do harness bloqueiam destinos fora de loopback e removem
 """
 
 import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -35,7 +36,7 @@ DESTINATARIOS_NO_LIMITE = [f"destinatario{indice}@exemplo.com" for indice in ran
 DESTINATARIOS_ACIMA_DO_LIMITE = [f"destinatario{indice}@exemplo.com" for indice in range(21)]
 
 
-def _without(config_writer, *keys: str) -> Path:
+def _without(config_writer: Callable[..., Path], *keys: str) -> Path:
     """Escreve o ``config.yaml`` do harness sem as chaves indicadas.
 
     Aceita chave de primeiro nível (``"tickers"``) e caminho pontuado
@@ -56,7 +57,9 @@ def _without(config_writer, *keys: str) -> Path:
 # --- Configuração válida ---------------------------------------------------
 
 
-def test_configuracao_valida_devolve_os_campos_do_arquivo(config_writer):
+def test_configuracao_valida_devolve_os_campos_do_arquivo(
+    config_writer: Callable[..., Path]
+) -> None:
     config = load_config(config_writer())
 
     assert isinstance(config, Config)
@@ -70,14 +73,16 @@ def test_configuracao_valida_devolve_os_campos_do_arquivo(config_writer):
     assert isinstance(config.timezone, ZoneInfo)
 
 
-def test_ordem_dos_tickers_do_arquivo_e_preservada(config_writer):
+def test_ordem_dos_tickers_do_arquivo_e_preservada(config_writer: Callable[..., Path]) -> None:
     config = load_config(config_writer(tickers=["MSFT", "PETR4.SA", "AAPL"]))
 
     assert isinstance(config.tickers, tuple)
     assert config.tickers == ("MSFT", "PETR4.SA", "AAPL")
 
 
-def test_ordem_dos_destinatarios_do_arquivo_e_preservada(config_writer):
+def test_ordem_dos_destinatarios_do_arquivo_e_preservada(
+    config_writer: Callable[..., Path]
+) -> None:
     config = load_config(
         config_writer(
             recipients=["segundo@exemplo.com", "primeiro@exemplo.com"],
@@ -88,14 +93,16 @@ def test_ordem_dos_destinatarios_do_arquivo_e_preservada(config_writer):
     assert config.recipients == ("segundo@exemplo.com", "primeiro@exemplo.com")
 
 
-def test_porta_padrao_e_587_quando_a_chave_esta_ausente(config_writer):
+def test_porta_padrao_e_587_quando_a_chave_esta_ausente(config_writer: Callable[..., Path]) -> None:
     config = load_config(_without(config_writer, "smtp.port"))
 
     assert config.smtp.port == 587
     assert config.smtp.host == "localhost"
 
 
-def test_fuso_padrao_e_sao_paulo_quando_a_chave_esta_ausente(config_writer):
+def test_fuso_padrao_e_sao_paulo_quando_a_chave_esta_ausente(
+    config_writer: Callable[..., Path]
+) -> None:
     config = load_config(_without(config_writer, "timezone"))
 
     assert config.timezone_name == "America/Sao_Paulo"
@@ -103,7 +110,9 @@ def test_fuso_padrao_e_sao_paulo_quando_a_chave_esta_ausente(config_writer):
     assert str(config.timezone) == "America/Sao_Paulo"
 
 
-def test_limites_de_50_ativos_e_20_destinatarios_sao_aceitos(config_writer):
+def test_limites_de_50_ativos_e_20_destinatarios_sao_aceitos(
+    config_writer: Callable[..., Path]
+) -> None:
     path = config_writer(tickers=TICKERS_NO_LIMITE, recipients=DESTINATARIOS_NO_LIMITE)
 
     config = load_config(path)
@@ -115,7 +124,7 @@ def test_limites_de_50_ativos_e_20_destinatarios_sao_aceitos(config_writer):
 # --- Regras de ``tickers`` -------------------------------------------------
 
 
-def test_tickers_ausentes_levantam_config_error(config_writer):
+def test_tickers_ausentes_levantam_config_error(config_writer: Callable[..., Path]) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(_without(config_writer, "tickers"))
 
@@ -137,7 +146,9 @@ def test_tickers_ausentes_levantam_config_error(config_writer):
         ),
     ],
 )
-def test_tickers_invalidos_levantam_config_error(config_writer, overrides, reason):
+def test_tickers_invalidos_levantam_config_error(
+    config_writer: Callable[..., Path], overrides: dict[str, object], reason: str
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(**overrides))
 
@@ -146,7 +157,7 @@ def test_tickers_invalidos_levantam_config_error(config_writer, overrides, reaso
     assert reason in message
 
 
-def test_ticker_duplicado_ignora_caixa_e_cita_o_valor(config_writer):
+def test_ticker_duplicado_ignora_caixa_e_cita_o_valor(config_writer: Callable[..., Path]) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(tickers=["AAPL", "aapl"]))
 
@@ -159,7 +170,7 @@ def test_ticker_duplicado_ignora_caixa_e_cita_o_valor(config_writer):
 # --- Regras de ``recipients`` ----------------------------------------------
 
 
-def test_recipients_ausentes_levantam_config_error(config_writer):
+def test_recipients_ausentes_levantam_config_error(config_writer: Callable[..., Path]) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(_without(config_writer, "recipients"))
 
@@ -185,7 +196,9 @@ def test_recipients_ausentes_levantam_config_error(config_writer):
         ),
     ],
 )
-def test_recipients_invalidos_levantam_config_error(config_writer, overrides, reason):
+def test_recipients_invalidos_levantam_config_error(
+    config_writer: Callable[..., Path], overrides: dict[str, object], reason: str
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(**overrides))
 
@@ -197,7 +210,7 @@ def test_recipients_invalidos_levantam_config_error(config_writer, overrides, re
 # --- Regras de ``sender`` --------------------------------------------------
 
 
-def test_sender_ausente_levanta_config_error(config_writer):
+def test_sender_ausente_levanta_config_error(config_writer: Callable[..., Path]) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(_without(config_writer, "sender"))
 
@@ -213,7 +226,9 @@ def test_sender_ausente_levanta_config_error(config_writer):
         pytest.param("Nome <a@b.com>", "sem nome de exibição", id="com-nome-de-exibicao"),
     ],
 )
-def test_sender_invalido_levanta_config_error(config_writer, sender, reason):
+def test_sender_invalido_levanta_config_error(
+    config_writer: Callable[..., Path], sender: str, reason: str
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(sender=sender))
 
@@ -232,7 +247,9 @@ def test_sender_invalido_levanta_config_error(config_writer, sender, reason):
         pytest.param({"smtp": {"host": "   "}}, "host vazio", id="host-em-branco"),
     ],
 )
-def test_smtp_host_invalido_levanta_config_error(config_writer, overrides, reason):
+def test_smtp_host_invalido_levanta_config_error(
+    config_writer: Callable[..., Path], overrides: dict[str, object], reason: str
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(**overrides))
 
@@ -241,7 +258,9 @@ def test_smtp_host_invalido_levanta_config_error(config_writer, overrides, reaso
     assert reason in message
 
 
-def test_smtp_ausente_levanta_config_error_citando_o_host(config_writer):
+def test_smtp_ausente_levanta_config_error_citando_o_host(
+    config_writer: Callable[..., Path]
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(_without(config_writer, "smtp"))
 
@@ -251,7 +270,9 @@ def test_smtp_ausente_levanta_config_error_citando_o_host(config_writer):
 
 
 @pytest.mark.parametrize("port", ["abc", 0, -1, 65536])
-def test_smtp_port_invalido_levanta_config_error(config_writer, port):
+def test_smtp_port_invalido_levanta_config_error(
+    config_writer: Callable[..., Path], port: object
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(smtp={"port": port}))
 
@@ -264,7 +285,9 @@ def test_smtp_port_invalido_levanta_config_error(config_writer, port):
 # --- Regras de ``timezone`` ------------------------------------------------
 
 
-def test_timezone_invalido_vira_config_error_citando_o_fuso(config_writer):
+def test_timezone_invalido_vira_config_error_citando_o_fuso(
+    config_writer: Callable[..., Path]
+) -> None:
     """Um nome IANA inválido não pode escapar como ``ZoneInfoNotFoundError``."""
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(timezone="Nao/Existe"))
@@ -277,14 +300,14 @@ def test_timezone_invalido_vira_config_error_citando_o_fuso(config_writer):
 # --- Chaves desconhecidas e credenciais no arquivo -------------------------
 
 
-def test_chave_desconhecida_no_topo_e_rejeitada(config_writer):
+def test_chave_desconhecida_no_topo_e_rejeitada(config_writer: Callable[..., Path]) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(foo=1))
 
     assert "foo" in str(excinfo.value)
 
 
-def test_chave_desconhecida_no_bloco_smtp_e_rejeitada(config_writer):
+def test_chave_desconhecida_no_bloco_smtp_e_rejeitada(config_writer: Callable[..., Path]) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(smtp={"user": "x"}))
 
@@ -292,8 +315,8 @@ def test_chave_desconhecida_no_bloco_smtp_e_rejeitada(config_writer):
 
 
 def test_credencial_no_topo_e_rejeitada_como_chave_desconhecida(
-    config_writer, sentinel_password
-):
+    config_writer: Callable[..., Path], sentinel_password: str
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(password=sentinel_password))
 
@@ -303,8 +326,8 @@ def test_credencial_no_topo_e_rejeitada_como_chave_desconhecida(
 
 
 def test_credencial_no_bloco_smtp_e_rejeitada_como_chave_desconhecida(
-    config_writer, sentinel_password
-):
+    config_writer: Callable[..., Path], sentinel_password: str
+) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(smtp={"password": sentinel_password}))
 
@@ -368,8 +391,11 @@ def test_credencial_no_bloco_smtp_e_rejeitada_como_chave_desconhecida(
     ],
 )
 def test_primeiro_campo_invalido_e_o_reportado(
-    config_writer, overrides, earliest, later_fields
-):
+    config_writer: Callable[..., Path],
+    overrides: dict[str, object],
+    earliest: str,
+    later_fields: tuple[str, ...],
+) -> None:
     """Com todos os campos quebrados, a mensagem nomeia só o primeiro da ordem."""
     with pytest.raises(ConfigError) as excinfo:
         load_config(config_writer(**overrides))
@@ -383,7 +409,7 @@ def test_primeiro_campo_invalido_e_o_reportado(
 # --- Falhas do arquivo inteiro ---------------------------------------------
 
 
-def test_arquivo_ausente_cita_o_caminho_e_nao_encontrado(tmp_path):
+def test_arquivo_ausente_cita_o_caminho_e_nao_encontrado(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_config(tmp_path / "nao-existe.yaml")
 
@@ -392,7 +418,7 @@ def test_arquivo_ausente_cita_o_caminho_e_nao_encontrado(tmp_path):
     assert "não encontrado" in message
 
 
-def test_yaml_invalido_cita_a_linha(config_writer):
+def test_yaml_invalido_cita_a_linha(config_writer: Callable[..., Path]) -> None:
     path = config_writer(raw="tickers: [AAPL\n")
 
     with pytest.raises(ConfigError) as excinfo:
@@ -403,7 +429,9 @@ def test_yaml_invalido_cita_a_linha(config_writer):
     assert "linha" in message
 
 
-def test_conteudo_que_nao_e_mapeamento_levanta_config_error(config_writer):
+def test_conteudo_que_nao_e_mapeamento_levanta_config_error(
+    config_writer: Callable[..., Path]
+) -> None:
     path = config_writer(raw="- a\n- b\n")
 
     with pytest.raises(ConfigError) as excinfo:
@@ -413,7 +441,7 @@ def test_conteudo_que_nao_e_mapeamento_levanta_config_error(config_writer):
     assert "mapeamento" in str(excinfo.value)
 
 
-def test_documento_vazio_levanta_config_error(config_writer):
+def test_documento_vazio_levanta_config_error(config_writer: Callable[..., Path]) -> None:
     path = config_writer(raw="")
 
     with pytest.raises(ConfigError) as excinfo:
@@ -426,7 +454,9 @@ def test_documento_vazio_levanta_config_error(config_writer):
 # --- Credenciais do ambiente -----------------------------------------------
 
 
-def test_load_credentials_devolve_o_par_do_mapeamento(sentinel_username, sentinel_password):
+def test_load_credentials_devolve_o_par_do_mapeamento(
+    sentinel_username: str, sentinel_password: str
+) -> None:
     credentials = load_credentials(
         {"SMTP_USERNAME": sentinel_username, "SMTP_PASSWORD": sentinel_password}
     )
@@ -436,7 +466,7 @@ def test_load_credentials_devolve_o_par_do_mapeamento(sentinel_username, sentine
     assert credentials.password == sentinel_password
 
 
-def test_load_credentials_sem_usuario_cita_a_variavel(sentinel_password):
+def test_load_credentials_sem_usuario_cita_a_variavel(sentinel_password: str) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_credentials({"SMTP_PASSWORD": sentinel_password})
 
@@ -445,7 +475,7 @@ def test_load_credentials_sem_usuario_cita_a_variavel(sentinel_password):
     assert sentinel_password not in message
 
 
-def test_load_credentials_sem_senha_cita_a_variavel(sentinel_username):
+def test_load_credentials_sem_senha_cita_a_variavel(sentinel_username: str) -> None:
     with pytest.raises(ConfigError) as excinfo:
         load_credentials({"SMTP_USERNAME": sentinel_username})
 
@@ -455,8 +485,8 @@ def test_load_credentials_sem_senha_cita_a_variavel(sentinel_username):
 
 
 def test_load_credentials_le_so_o_mapeamento_recebido(
-    monkeypatch, sentinel_username, sentinel_password
-):
+    monkeypatch: pytest.MonkeyPatch, sentinel_username: str, sentinel_password: str
+) -> None:
     """As variáveis definidas no ambiente não substituem o mapeamento recebido."""
     monkeypatch.setenv("SMTP_USERNAME", sentinel_username)
     monkeypatch.setenv("SMTP_PASSWORD", sentinel_password)
@@ -467,7 +497,9 @@ def test_load_credentials_le_so_o_mapeamento_recebido(
     assert "SMTP_USERNAME" in str(excinfo.value)
 
 
-def test_repr_e_str_de_credentials_nao_expoem_a_senha(sentinel_username, sentinel_password):
+def test_repr_e_str_de_credentials_nao_expoem_a_senha(
+    sentinel_username: str, sentinel_password: str
+) -> None:
     credentials = load_credentials(
         {"SMTP_USERNAME": sentinel_username, "SMTP_PASSWORD": sentinel_password}
     )
@@ -480,7 +512,7 @@ def test_repr_e_str_de_credentials_nao_expoem_a_senha(sentinel_username, sentine
 # --- Imutabilidade ---------------------------------------------------------
 
 
-def test_config_e_imutavel(config_writer):
+def test_config_e_imutavel(config_writer: Callable[..., Path]) -> None:
     config = load_config(config_writer())
 
     with pytest.raises(dataclasses.FrozenInstanceError):

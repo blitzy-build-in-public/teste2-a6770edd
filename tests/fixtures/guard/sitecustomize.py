@@ -11,20 +11,30 @@ destino não seja loopback, e faz ``connect_ex()`` devolver ``errno.ECONNREFUSED
 para esses mesmos destinos. É disso que depende o critério de aceitação segundo o
 qual ``check-config`` e a suíte nunca acessam a rede externa.
 
-O módulo é silencioso (não imprime, não loga, não emite avisos), usa apenas a
+O módulo é silencioso (não imprime, não loga, não emite avisos), com uma única
+exceção: se a instalação falhar e a variável de ambiente ``FINMAIL_GUARD_DEBUG``
+estiver definida, uma linha com a causa vai para ``stderr``. Fora isso, usa apenas a
 biblioteca padrão e não resolve nome algum: ele julga o destino pelo que recebe,
 sem consultar DNS.
 """
 
 import errno
 import ipaddress
+import os
 import socket
+import sys
+from typing import Any
 
 _LOOPBACK_V4 = ipaddress.ip_network('127.0.0.0/8')
 _LOOPBACK_V6 = ipaddress.IPv6Address('::1')
 
 _GUARD_MARKER = '__finmail_guard__'
 _BLOCKED_MESSAGE = 'acesso de rede externo bloqueado pela guarda de teste: '
+
+# Causa da última falha de instalação. A guarda que não instala não pode derrubar a
+# suíte, mas a razão também não pode ser descartada: fica aqui, preenchida por
+# ``_surface_install_failure``.
+_INSTALL_ERROR: BaseException | None = None
 
 
 def _is_loopback_host(host: object) -> bool:
@@ -77,7 +87,7 @@ def _install() -> None:
     if getattr(original_connect, _GUARD_MARKER, False):
         return
 
-    def connect(self, address, *args, **kwargs):
+    def connect(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
         if not _is_allowed(address):
             # Levanta antes de tocar o socket: o destino externo nunca chega ao SO.
             raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
@@ -92,7 +102,7 @@ def _install() -> None:
     if getattr(original_connect_ex, _GUARD_MARKER, False):
         return
 
-    def connect_ex(self, address, *args, **kwargs) -> int:
+    def connect_ex(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> int:
         if not _is_allowed(address):
             # ``connect_ex`` sinaliza erro pelo retorno, não por exceção.
             return errno.ECONNREFUSED
@@ -102,7 +112,22 @@ def _install() -> None:
     socket.socket.connect_ex = connect_ex
 
 
+def _surface_install_failure(exc: BaseException) -> None:
+    """Registra a falha de instalação da guarda em vez de descartá-la.
+
+    Uma guarda que não instala não pode transformar a inicialização da suíte num
+    ``ImportError``, por isso a causa não é relançada. Descartá-la também não serve:
+    ela fica no atributo de módulo ``_INSTALL_ERROR`` para quem investiga. Quando
+    ``FINMAIL_GUARD_DEBUG`` está definida no ambiente, a causa vira ainda uma única
+    linha em ``stderr``; sem essa variável, o módulo continua silencioso.
+    """
+    global _INSTALL_ERROR
+    _INSTALL_ERROR = exc
+    if os.environ.get('FINMAIL_GUARD_DEBUG'):
+        print(f'guarda de rede do finmail não instalada: {exc!r}', file=sys.stderr)
+
+
 try:
     _install()
-except Exception:  # guarda que não instala não pode transformar a suíte num ImportError
-    pass
+except Exception as exc:  # guarda que não instala não pode transformar a suíte num ImportError
+    _surface_install_failure(exc)

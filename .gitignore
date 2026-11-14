@@ -17,3 +17,7 @@ venv/
 
 # Credenciais do operador: apenas o modelo .env.example é versionado, o .env real nunca é.
 .env
+
+# Configuração do operador: apenas o modelo config.example.yaml é versionado, o config.yaml real da
+# raiz (destinatários e host SMTP) nunca é. A barra inicial ancora a regra na raiz do repositório.
+/config.yaml

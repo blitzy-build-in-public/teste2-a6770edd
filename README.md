@@ -390,6 +390,7 @@ problema na fonte de dados naquele momento, não no produto.
 Com uma configuração de 50 ativos, execute pelo menos 20 vezes e registre o tempo de parede de cada execução:
 
 ```bash
+: > tempos.txt   # zera a amostra: o p95 mede apenas as 20 execuções deste laço
 for i in $(seq 1 20); do
   inicio=$(date +%s)
   python -m finmail run --dry-run --config ./config-50.yaml > /dev/null
@@ -413,4 +414,4 @@ esperada é de 0,11 a 0,30 s por ativo, ou seja cerca de 7 s para 50 ativos.
 | Código de saída `4` | A transação SMTP falhou depois das tentativas; a linha nomeia host, porta e código de resposta. Confira host, porta, credenciais e se o servidor oferece STARTTLS. Falha de autenticação não é repetida. |
 | Código de saída `2` | Nenhum ativo retornou dados. Confira os símbolos (ações da B3 terminam em `.SA`, criptomoedas usam o par com hífen) e a conectividade com o Yahoo Finance; nenhum e-mail é enviado nesse caso. |
 | Linha com `dados indisponíveis` | Problema na fonte de dados apenas para aquele símbolo; o motivo aparece na coluna `Estado` e os demais ativos seguem normalmente. |
-| Código de saída `1` | Defeito inesperado do programa; o traceback vai para `stderr` e para o log. |
+| Código de saída `1` | Defeito inesperado do programa; o log em `stdout` traz o `ERROR` com o traceback e o `stderr` traz uma única linha de diagnóstico. |
