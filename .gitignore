@@ -1,0 +1,23 @@
+# Bytecode e caches do interpretador Python
+__pycache__/
+*.py[cod]
+
+# Artefatos de empacotamento gerados por setuptools e pip
+# (o "pip install -e .[dev]" cria finmail.egg-info/ ao lado do pacote)
+*.egg-info/
+build/
+dist/
+
+# Ambientes virtuais
+.venv/
+venv/
+
+# Cache do pytest
+.pytest_cache/
+
+# Credenciais do operador: apenas o modelo .env.example é versionado, o .env real nunca é.
+.env
+
+# Configuração do operador: apenas o modelo config.example.yaml é versionado, o config.yaml real da
+# raiz (destinatários e host SMTP) nunca é. A barra inicial ancora a regra na raiz do repositório.
+/config.yaml

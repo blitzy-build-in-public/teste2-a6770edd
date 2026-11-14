@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ subject }}</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 14px;
+      color: #222222;
+    }
+    h1 {
+      font-size: 18px;
+    }
+    .tabela {
+      /* Rolagem horizontal: a tabela não empurra a página além da tela estreita. */
+      overflow-x: auto;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #ddd;
+      overflow-wrap: break-word;
+    }
+    th {
+      background: #f4f4f4;
+      text-align: left;
+    }
+    td.num {
+      text-align: right;
+    }
+    .positivo {
+      color: #1a7f37;
+    }
+    .negativo {
+      color: #c62828;
+    }
+    .neutro {
+      color: #666666;
+    }
+    .falha {
+      color: #666666;
+    }
+    p {
+      color: #666666;
+      font-size: 12px;
+    }
+    @media (max-width: 860px) {
+      /* Abaixo desta largura a tabela rola dentro da .tabela, sem alargar a página. */
+      table {
+        font-size: 12px;
+      }
+      th, td {
+        padding: 4px 4px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>{{ subject }}</h1>
+  <div class="tabela">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Ticker</th>
+        <th scope="col">Nome</th>
+        <th scope="col">Moeda</th>
+        <th scope="col">Data do último pregão</th>
+        <th scope="col">Fechamento</th>
+        <th scope="col">Variação</th>
+        <th scope="col">Variação %</th>
+        <th scope="col">Volume</th>
+        <th scope="col">Mín. 52s</th>
+        <th scope="col">Máx. 52s</th>
+        <th scope="col">Estado</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr{% if row.falha %} class="falha"{% endif %}>
+        <td>{{ row.ticker }}</td>
+        <td>{{ row.nome }}</td>
+        <td>{{ row.moeda }}</td>
+        <td>{{ row.data }}</td>
+        <td class="num">{{ row.fechamento }}</td>
+        <td class="num {{ row.direcao }}">{{ row.variacao }}</td>
+        <td class="num {{ row.direcao_pct }}">{{ row.variacao_pct }}</td>
+        <td class="num">{{ row.volume }}</td>
+        <td class="num">{{ row.min52 }}</td>
+        <td class="num">{{ row.max52 }}</td>
+        <td>{% if row.falha %}{{ estado_falha }}: {{ row.motivo }}{% else %}{{ estado_ok }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p>{{ footer }}</p>
+</body>
+</html>

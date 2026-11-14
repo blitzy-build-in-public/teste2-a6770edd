@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finmail"
+version = "0.1.0"
+description = "Resumo diário de mercado por e-mail, com cotações do Yahoo Finance."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "yfinance==0.2.66",
+    # Fixado apenas para segurar a faixa <3: o yfinance 0.2.66 declara somente pandas>=1.3.0,
+    # e sem este pin a resolução instalaria pandas 3.x. Nenhum módulo de finmail importa pandas.
+    "pandas==2.3.3",
+    "PyYAML==6.0.3",
+    "Jinja2==3.1.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "aiosmtpd==1.4.6"]
+
+[tool.setuptools]
+packages = ["finmail"]
+
+[tool.setuptools.package-data]
+finmail = ["templates/*.j2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
