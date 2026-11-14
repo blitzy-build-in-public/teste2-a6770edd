@@ -145,6 +145,11 @@ def test_tickers_ausentes_levantam_config_error(config_writer: Callable[..., Pat
             "acima do limite",
             id="51-ativos",
         ),
+        pytest.param(
+            {"tickers": "AAPL"},
+            "deve ser uma lista de strings, recebido texto",
+            id="tickers-nao-lista",
+        ),
     ],
 )
 def test_tickers_invalidos_levantam_config_error(
@@ -195,6 +200,11 @@ def test_recipients_ausentes_levantam_config_error(config_writer: Callable[..., 
             "sem nome de exibição",
             id="com-nome-de-exibicao",
         ),
+        pytest.param(
+            {"recipients": "a@b.com"},
+            "deve ser uma lista de endereços, recebido texto",
+            id="recipients-nao-lista",
+        ),
     ],
 )
 def test_recipients_invalidos_levantam_config_error(
@@ -225,6 +235,7 @@ def test_sender_ausente_levanta_config_error(config_writer: Callable[..., Path])
     [
         pytest.param("invalido", "endereço inválido", id="sem-arroba"),
         pytest.param("Nome <a@b.com>", "sem nome de exibição", id="com-nome-de-exibicao"),
+        pytest.param("", "remetente ausente", id="em-branco"),
     ],
 )
 def test_sender_invalido_levanta_config_error(
@@ -270,7 +281,7 @@ def test_smtp_ausente_levanta_config_error_citando_o_host(
     assert "ausente" in message
 
 
-@pytest.mark.parametrize("port", ["abc", 0, -1, 65536])
+@pytest.mark.parametrize("port", ["abc", 0, -1, 65536, pytest.param(True, id="booleano")])
 def test_smtp_port_invalido_levanta_config_error(
     config_writer: Callable[..., Path], port: object
 ) -> None:
@@ -331,7 +342,7 @@ def test_leitura_do_fuso_com_tzdata_ilegivel_vira_config_error(
 ) -> None:
     """Um ``OSError`` do ``ZoneInfo`` (tzdata quebrado) não escapa como traceback."""
 
-    def zoneinfo_com_falha(name):
+    def zoneinfo_com_falha(name: str) -> ZoneInfo:
         raise OSError(f"tzdata indisponível para o fuso {name}")
 
     monkeypatch.setattr("finmail.config.ZoneInfo", zoneinfo_com_falha)
@@ -789,4 +800,3 @@ def test_config_e_imutavel(config_writer: Callable[..., Path]) -> None:
         config.sender = "outro@exemplo.com"
     with pytest.raises(dataclasses.FrozenInstanceError):
         config.smtp.port = 25
-
