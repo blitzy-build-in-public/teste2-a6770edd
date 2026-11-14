@@ -186,7 +186,7 @@ class FakeYf:
         self._cached_metadata = cached_metadata
         self.created: list[RecordingTicker] = []
 
-    def Ticker(self, symbol: str) -> RecordingTicker:  # noqa: N802 - nome da biblioteca
+    def Ticker(self, symbol: str) -> RecordingTicker:
         """Cria o instrumento dublê e guarda a instância para as asserções."""
         instrument = RecordingTicker(
             symbol,
@@ -702,7 +702,7 @@ def test_certificado_invalido_nao_e_repetido(monkeypatch: pytest.MonkeyPatch) ->
     assert_single_attempt(fake, waits)
     assert excinfo.value.ticker == TICKER
     # O motivo nomeia o certificado, para o operador diagnosticar o host sem os 4 s de
-    # espera que a classificação anterior gastava antes do mesmo desfecho.
+    # espera que uma repetição gastaria antes do mesmo desfecho.
     assert "certificado" in excinfo.value.reason.lower()
     assert "\n" not in excinfo.value.reason
 
