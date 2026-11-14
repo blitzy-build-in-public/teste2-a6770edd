@@ -94,13 +94,34 @@ _BLOCKED_MESSAGE = "acesso de rede externo bloqueado pela guarda de teste: "
 _LOOPBACK_V4 = ipaddress.ip_network("127.0.0.0/8")
 _LOOPBACK_V6 = ipaddress.IPv6Address("::1")
 
+
+class _NameResolutionBlocked(ConnectionRefusedError, socket.gaierror):
+    """Recusa de resolução de um nome externo.
+
+    É a ``ConnectionRefusedError`` da guarda e, ao mesmo tempo, o ``socket.gaierror``
+    que um host sem rede produz para o mesmo nome. A segunda base não afrouxa a
+    recusa — nada é resolvido —, mas preserva o significado que quem chama
+    ``getaddrinfo``/``gethostbyname`` espera de um nome que não resolve: o
+    ``smtplib`` captura ``gaierror``, e apenas ele, ao procurar o nome da própria
+    máquina para o ``EHLO`` e cair no endereço literal. Sem ela, recusar um nome
+    externo viraria um defeito do produto no lugar de uma falha de nome esperada.
+    """
+
+
 # Sondagem da guarda de rede, executada uma vez por sessão em um subprocesso cujo
 # ambiente é o de ``_subprocess_env``. Os dois argumentos são o diretório da guarda e
 # o diretório do dublê de ``yfinance``. O código roda no filho, não imprime nada no
 # caminho de sucesso e falha com um traceback que nomeia a verificação que caiu. O
 # destino 192.0.2.1 (TEST-NET-1) é recusado pela guarda antes de o SO ser tocado; sem
 # guarda, o ``timeout`` de 1 s limita a espera e a tentativa não termina em
-# ``ConnectionRefusedError`` nem em ``errno.ECONNREFUSED``.
+# ``ConnectionRefusedError`` nem em ``errno.ECONNREFUSED``. Os alvos da prova de
+# datagrama e de resolução são escolhidos para o mesmo efeito: sem guarda, um
+# ``sendto`` para um endereço TEST-NET-1 não levanta nada e ``externo.invalid``
+# (RFC 6761, que nunca resolve) levanta ``socket.gaierror``, de modo que uma guarda
+# ausente reprova a sondagem em vez de alcançar um serviço real. O host em ``bytes`` —
+# forma que o CPython aceita tanto num sockaddr quanto na resolução — é provado em
+# todas as entradas junto da forma em ``str``: sem a decodificação, ele seria a única
+# porta aberta da superfície.
 _GUARD_PROBE_CODE = """
 import errno
 import os
@@ -110,6 +131,7 @@ import sys
 
 guard_dir = pathlib.Path(sys.argv[1]).resolve()
 stub_dir = pathlib.Path(sys.argv[2]).resolve()
+bloqueio = "acesso de rede externo bloqueado pela guarda de teste: "
 
 guarda = sys.modules.get("sitecustomize")
 assert guarda is not None, "sitecustomize nao foi carregado no subprocesso"
@@ -118,11 +140,19 @@ assert carregada == guard_dir / "sitecustomize.py", (
     "sitecustomize veio de %s, esperado %s" % (carregada, guard_dir / "sitecustomize.py")
 )
 
-for nome in ("connect", "connect_ex"):
-    alvo = getattr(socket.socket, nome)
-    assert getattr(alvo, "__finmail_guard__", False), (
-        "socket.socket.%s nao carrega a marca __finmail_guard__" % nome
-    )
+for dono, prefixo, nomes in (
+    (socket.socket, "socket.socket", ("connect", "connect_ex", "sendto", "sendmsg")),
+    (
+        socket,
+        "socket",
+        ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr"),
+    ),
+):
+    for nome in nomes:
+        alvo = getattr(dono, nome)
+        assert getattr(alvo, "__finmail_guard__", False), (
+            "%s.%s nao carrega a marca __finmail_guard__" % (prefixo, nome)
+        )
 
 for nome in ("SMTP_USERNAME", "SMTP_PASSWORD"):
     assert nome not in os.environ, (
@@ -143,29 +173,99 @@ except ConnectionRefusedError:
 else:
     raise AssertionError("create_connection para destino externo nao foi recusado")
 
-sonda = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+def recusa(nome, envio):
+    try:
+        envio()
+    except ConnectionRefusedError as exc:
+        assert str(exc).startswith(bloqueio), (
+            "%s recusado com mensagem inesperada: %s" % (nome, exc)
+        )
+    else:
+        raise AssertionError("%s nao foi recusado" % nome)
+
+
+for host in ("192.0.2.1", b"192.0.2.1"):
+    sonda = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sonda.settimeout(1)
+        codigo = sonda.connect_ex((host, 80))
+    finally:
+        sonda.close()
+    assert codigo == errno.ECONNREFUSED, (
+        "connect_ex com host %r para destino externo devolveu %r, esperado ECONNREFUSED (%d)"
+        % (host, codigo, errno.ECONNREFUSED)
+    )
+
+datagrama = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
-    sonda.settimeout(1)
-    codigo = sonda.connect_ex(("192.0.2.1", 80))
+    datagrama.settimeout(1)
+    for host in ("192.0.2.1", b"192.0.2.1"):
+        recusa(
+            "sendto externo com host %r" % (host,),
+            lambda: datagrama.sendto(b"x", (host, 53)),
+        )
+        recusa(
+            "sendmsg externo com host %r" % (host,),
+            lambda: datagrama.sendmsg([b"x"], [], 0, (host, 53)),
+        )
 finally:
-    sonda.close()
-assert codigo == errno.ECONNREFUSED, (
-    "connect_ex para destino externo devolveu %r, esperado ECONNREFUSED (%d)"
-    % (codigo, errno.ECONNREFUSED)
-)
+    datagrama.close()
+
+for nome, resolver, argumentos in (
+    ("getaddrinfo de nome externo", socket.getaddrinfo, ("externo.invalid", 443)),
+    ("gethostbyname de nome externo", socket.gethostbyname, ("externo.invalid",)),
+    ("getaddrinfo de nome em branco", socket.getaddrinfo, (" ", 80)),
+):
+    try:
+        resolver(*argumentos)
+    except ConnectionRefusedError as exc:
+        assert str(exc).startswith(bloqueio), (
+            "%s recusado com mensagem inesperada: %s" % (nome, exc)
+        )
+    else:
+        raise AssertionError("%s nao foi recusado" % nome)
+
+locais = socket.getaddrinfo("localhost", 587)
+assert locais, "getaddrinfo('localhost', 587) nao devolveu endereco algum"
+
+receptor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+emissor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    receptor.bind(("127.0.0.1", 0))
+    receptor.settimeout(2)
+    destino = receptor.getsockname()
+    assert emissor.sendto(b"p", destino) == 1, "sendto de loopback falhou"
+    assert receptor.recvfrom(1)[0] == b"p", "o datagrama de loopback nao chegou"
+    assert emissor.sendmsg([b"q"], [], 0, destino) == 1, "sendmsg de loopback falhou"
+    assert receptor.recvfrom(1)[0] == b"q", "o datagrama de sendmsg nao chegou"
+    destino_bytes = (destino[0].encode("ascii"), destino[1])
+    assert emissor.sendto(b"r", destino_bytes) == 1, "sendto de loopback com host bytes falhou"
+    assert receptor.recvfrom(1)[0] == b"r", "o datagrama de loopback com host bytes nao chegou"
+finally:
+    emissor.close()
+    receptor.close()
 """
 
 
 def _is_loopback_host(host: object) -> bool:
     """Diz se o host de um sockaddr é loopback, sem resolver nome algum.
 
-    Um host que não é ``str`` não pode ser classificado como externo e é liberado.
-    ``localhost`` e seus subdomínios são liberados porque o sistema operacional os
-    resolve por ``/etc/hosts``. Qualquer outro nome é recusado: só poderia ser
-    alcançado por resolução externa, que esta guarda nunca faz.
+    ``bytes`` é decodificado como ASCII, que é a segunda forma que o CPython aceita
+    para o host de um sockaddr; sem isso a forma em ``bytes`` seria a única porta
+    aberta da guarda. O que não decodifica, e qualquer host que não seja ``str`` nem
+    ``bytes``, não é algo que esta guarda consiga provar loopback, e é recusado: só o
+    que ela pode provar é liberado. ``localhost`` e seus subdomínios são liberados
+    porque o sistema operacional os resolve por ``/etc/hosts``. Qualquer outro nome é
+    recusado: só poderia ser alcançado por resolução externa, que esta guarda nunca faz.
     """
+    if isinstance(host, bytes):
+        try:
+            host = host.decode("ascii")
+        except UnicodeDecodeError:
+            return False
     if not isinstance(host, str):
-        return True
+        return False
     # A forma canônica vem primeiro: ``ipaddress.ip_address('LOCALHOST.')`` levanta
     # ValueError, e o sufixo ponto final só aparece depois de normalizar.
     name = host.strip().lower().rstrip(".")
@@ -185,7 +285,7 @@ def _is_loopback_host(host: object) -> bool:
 
 
 def _is_allowed(address: object) -> bool:
-    """Diz se um destino de ``connect``/``connect_ex`` pode ser usado.
+    """Diz se um destino de conexão ou de envio de datagrama pode ser usado.
 
     Só tuplas de ``AF_INET``/``AF_INET6`` são julgadas, e apenas pelo primeiro item:
     ``AF_INET6`` chega como 4-tupla ``(host, port, flowinfo, scope_id)``. Caminhos de
@@ -196,60 +296,144 @@ def _is_allowed(address: object) -> bool:
     return _is_loopback_host(address[0])
 
 
-def _install_socket_guard() -> tuple[Any, Any] | None:
+def _is_resolvable_host(host: object) -> bool:
+    """Diz se um host entregue à resolução de nome pode ser consultado.
+
+    ``None`` e a string vazia são o "sem nome" de ``getaddrinfo`` — a consulta de bind
+    de quem vai escutar, com ``AI_PASSIVE`` —, e não há nome a resolver. Todo o resto
+    é julgado como o host de um sockaddr, pelo mesmo predicado de ``connect``: um nome
+    só de espaços não é o curinga da consulta de bind e é recusado, e a forma em
+    ``bytes`` é decodificada lá, como em qualquer outro destino.
+    """
+    if host is None or (isinstance(host, str) and not host):
+        return True
+    return _is_loopback_host(host)
+
+
+def _guarded_connect(original: Any) -> Any:
+    """Produz o ``connect`` que recusa um destino fora de loopback."""
+
+    def connect(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
+        if not _is_allowed(address):
+            # Levanta antes de tocar o socket: o destino externo nunca chega ao SO.
+            raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
+        return original(self, address, *args, **kwargs)
+
+    return connect
+
+
+def _guarded_connect_ex(original: Any) -> Any:
+    """Produz o ``connect_ex`` que sinaliza um destino fora de loopback pelo retorno."""
+
+    def connect_ex(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> int:
+        if not _is_allowed(address):
+            # ``connect_ex`` sinaliza erro pelo retorno, não por exceção.
+            return errno.ECONNREFUSED
+        return original(self, address, *args, **kwargs)
+
+    return connect_ex
+
+
+def _guarded_sendto(original: Any) -> Any:
+    """Produz o ``sendto`` que recusa o datagrama destinado a fora de loopback."""
+
+    def sendto(self: socket.socket, *args: Any, **kwargs: Any) -> int:
+        # O endereço é o último argumento posicional nas duas formas do método:
+        # ``sendto(data, address)`` e ``sendto(data, flags, address)``.
+        address = kwargs.get("address", args[-1] if args else None)
+        if not _is_allowed(address):
+            # Recusa antes da entrega: o datagrama externo nunca chega ao SO.
+            raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
+        return original(self, *args, **kwargs)
+
+    return sendto
+
+
+def _guarded_sendmsg(original: Any) -> Any:
+    """Produz o ``sendmsg`` que recusa o datagrama destinado a fora de loopback."""
+
+    def sendmsg(self: socket.socket, *args: Any, **kwargs: Any) -> int:
+        # ``sendmsg(buffers[, ancdata[, flags[, address]]])``: o endereço é a quarta
+        # posição e é opcional. Sem ele o socket já está conectado, e uma conexão
+        # externa só existiria se o ``connect`` desta mesma guarda a tivesse liberado.
+        if "address" in kwargs:
+            address = kwargs["address"]
+        else:
+            address = args[3] if len(args) > 3 else None
+        if address is not None and not _is_allowed(address):
+            raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
+        return original(self, *args, **kwargs)
+
+    return sendmsg
+
+
+def _guarded_resolver(original: Any) -> Any:
+    """Produz a entrada de resolução de nome que recusa consultar um nome externo."""
+
+    def resolve(host: object, *args: Any, **kwargs: Any) -> Any:
+        if not _is_resolvable_host(host):
+            raise _NameResolutionBlocked(_BLOCKED_MESSAGE + repr(host))
+        return original(host, *args, **kwargs)
+
+    return resolve
+
+
+# Superfície protegida numa tabela única: o atributo substituído e a fábrica do invólucro
+# que o substitui. É a mesma superfície que ``tests/fixtures/guard/sitecustomize.py``
+# aplica nos subprocessos, e a sondagem de ``guard_liveness`` confere a marca em cada
+# entrada; um nome acrescentado de um lado sem o correspondente do outro deixaria o
+# egresso aberto em um dos escopos.
+_HOOKS: tuple[tuple[Any, str, Callable[[Any], Any]], ...] = (
+    (socket.socket, "connect", _guarded_connect),
+    (socket.socket, "connect_ex", _guarded_connect_ex),
+    (socket.socket, "sendto", _guarded_sendto),
+    (socket.socket, "sendmsg", _guarded_sendmsg),
+    (socket, "getaddrinfo", _guarded_resolver),
+    (socket, "gethostbyname", _guarded_resolver),
+    (socket, "gethostbyname_ex", _guarded_resolver),
+    (socket, "gethostbyaddr", _guarded_resolver),
+)
+
+
+def _install_socket_guard() -> list[tuple[Any, str, Any]] | None:
     """Instala a guarda de loopback no processo e devolve o que restaurar.
 
-    Devolve ``None`` só quando as duas metades da guarda — ``connect`` e
-    ``connect_ex`` — já estavam instaladas, por exemplo pelo ``sitecustomize``
-    carregado no próprio processo, para que o teardown da fixture não desfaça uma
-    instalação que não é dela e nenhum invólucro se empilhe. Uma guarda pela metade
-    não conta como instalada: a metade que falta é posta aqui e o par de callables
-    anteriores à instalação é devolvido assim mesmo, de modo que o teardown reponha
-    exatamente o que esta função substituiu — inclusive um invólucro que já existia.
+    Devolve a lista de ``(dono, nome, original)`` de cada atributo substituído, para
+    que o teardown da fixture reponha exatamente o que esta função trocou — inclusive
+    um invólucro que já existia. Devolve ``None`` só quando toda a superfície de
+    ``_HOOKS`` já estava instalada, por exemplo pelo ``sitecustomize`` carregado no
+    próprio processo, para que o teardown não desfaça uma instalação que não é dela e
+    nenhum invólucro se empilhe. Uma guarda pela metade não conta como instalada: o
+    que falta é posto aqui e cada atributo trocado entra na lista.
     """
-    original_connect = socket.socket.connect
-    original_connect_ex = socket.socket.connect_ex
-    connect_guarded = getattr(original_connect, _GUARD_MARKER, False)
-    connect_ex_guarded = getattr(original_connect_ex, _GUARD_MARKER, False)
-    if connect_guarded and connect_ex_guarded:
-        return None
-
-    if not connect_guarded:
-
-        def connect(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
-            if not _is_allowed(address):
-                # Levanta antes de tocar o socket: o destino externo nunca chega ao SO.
-                raise ConnectionRefusedError(_BLOCKED_MESSAGE + repr(address))
-            return original_connect(self, address, *args, **kwargs)
-
-        setattr(connect, _GUARD_MARKER, True)
-        socket.socket.connect = connect
-
-    # ``connect_ex`` é outro descritor do mesmo objeto C: proteger só ``connect``
-    # deixaria um caminho aberto para a rede externa.
-    if not connect_ex_guarded:
-
-        def connect_ex(self: socket.socket, address: object, *args: Any, **kwargs: Any) -> int:
-            if not _is_allowed(address):
-                # ``connect_ex`` sinaliza erro pelo retorno, não por exceção.
-                return errno.ECONNREFUSED
-            return original_connect_ex(self, address, *args, **kwargs)
-
-        setattr(connect_ex, _GUARD_MARKER, True)
-        socket.socket.connect_ex = connect_ex
-
-    return original_connect, original_connect_ex
+    replaced: list[tuple[Any, str, Any]] = []
+    for owner, name, factory in _HOOKS:
+        current = getattr(owner, name)
+        if getattr(current, _GUARD_MARKER, False):
+            continue
+        wrapper = factory(current)
+        setattr(wrapper, _GUARD_MARKER, True)
+        setattr(owner, name, wrapper)
+        replaced.append((owner, name, current))
+    return replaced or None
 
 
 @pytest.fixture(autouse=True)
 def socket_guard() -> Iterator[None]:
-    """Bloqueia todo destino fora de loopback durante o teste (critérios 5 e 8)."""
+    """Bloqueia todo destino e todo nome fora de loopback durante o teste (5 e 8).
+
+    A superfície é a de ``_HOOKS``: ``connect``, ``connect_ex``, ``sendto`` e
+    ``sendmsg`` em ``socket.socket``, e ``getaddrinfo``, ``gethostbyname``,
+    ``gethostbyname_ex`` e ``gethostbyaddr`` no módulo ``socket``. O teardown repõe
+    exatamente os atributos que a instalação trocou, e nada quando a guarda já estava
+    inteira — por exemplo em um processo que carregou o ``sitecustomize``.
+    """
     installed = _install_socket_guard()
     try:
         yield
     finally:
-        if installed is not None:
-            socket.socket.connect, socket.socket.connect_ex = installed
+        for owner, name, original in installed or ():
+            setattr(owner, name, original)
 
 
 @pytest.fixture(autouse=True)
@@ -571,13 +755,16 @@ def guard_liveness() -> None:
     """Prova, em um subprocesso por sessão, que a guarda de rede está viva.
 
     Compor o ambiente de ``_subprocess_env`` só *arranja* o bloqueio: sem esta
-    sonda, uma guarda que tivesse deixado de instalar, uma marca ausente em
-    ``socket.socket.connect_ex`` ou um dublê de ``yfinance`` que perdesse a
-    precedência deixariam a suíte verde com a metade "sem rede" do critério 5 da
-    AAP 0.9 falsa. O filho carrega a guarda pelo ``sitecustomize``, confirma as duas
-    marcas e a origem do dublê e tenta um destino externo, que tem de ser recusado.
-    O caminho de sucesso é silencioso, como o de qualquer subprocesso do produto —
-    ``tests/test_end_to_end.py`` observa que não há nada em ``stderr``.
+    sonda, uma guarda que tivesse deixado de instalar, uma marca ausente em qualquer
+    elo da superfície — ``connect``, ``connect_ex``, ``sendto`` e ``sendmsg`` em
+    ``socket.socket``, mais ``getaddrinfo``, ``gethostbyname``, ``gethostbyname_ex``
+    e ``gethostbyaddr`` — ou um dublê de ``yfinance`` que perdesse a precedência
+    deixariam a suíte verde com a metade "sem rede" do critério 5 da AAP 0.9 falsa.
+    O filho carrega a guarda pelo ``sitecustomize``, confirma a marca em cada elo e a
+    origem do dublê, prova que conexão, datagrama e resolução de nome para fora de
+    loopback são recusados e que o caminho de loopback equivalente continua
+    funcionando. O caminho de sucesso é silencioso, como o de qualquer subprocesso do
+    produto — ``tests/test_end_to_end.py`` observa que não há nada em ``stderr``.
     """
     probe = _run(
         [sys.executable, "-c", _GUARD_PROBE_CODE, str(GUARD_DIR), str(STUB_DIR)],
@@ -589,9 +776,12 @@ def guard_liveness() -> None:
     assert probe.returncode == 0, (
         f"a sondagem da guarda de rede falhou no subprocesso (código "
         f"{probe.returncode}): a guarda de {GUARD_DIR / 'sitecustomize.py'} não foi "
-        "carregada a partir do PYTHONPATH, a marca __finmail_guard__ falta em "
-        "socket.socket.connect ou em socket.socket.connect_ex, o dublê de yfinance não "
-        "sombreia o pacote instalado, ou um destino externo não foi recusado.\n"
+        "carregada a partir do PYTHONPATH, a marca __finmail_guard__ falta em algum "
+        "elo da superfície (socket.socket.connect, connect_ex, sendto e sendmsg; "
+        "socket.getaddrinfo, gethostbyname, gethostbyname_ex e gethostbyaddr), o "
+        "dublê de yfinance não sombreia o pacote instalado, um destino externo de "
+        "conexão, de datagrama ou de resolução de nome não foi recusado, ou o "
+        "caminho de loopback deixou de funcionar.\n"
         f"stdout:\n{stdout}\nstderr:\n{stderr}"
     )
     assert stdout == "" and stderr == "", (
